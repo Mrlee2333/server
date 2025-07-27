@@ -16,7 +16,8 @@ const server = http.createServer((req, res) => {
 
 const peerServer = PeerServer({
   path: '/',
-  noServer: true
+  noServer: true,
+  allow_origin: '*' 
 });
 
 

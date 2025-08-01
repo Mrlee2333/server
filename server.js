@@ -90,7 +90,6 @@ const server = http.createServer(app);
 // PeerServer 配置
 const peerServer = ExpressPeerServer(server, {
   debug: true,
-  path: '/peerjs',
   proxied: true,
   generateClientId: uuidv4,
 });

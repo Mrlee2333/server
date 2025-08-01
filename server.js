@@ -2,7 +2,7 @@ const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const { ExpressPeerServer } = require('peer');
-const { v4: uuidv4 } = require('uuid'); // 推荐使用 uuid 来确保ID的唯一性
+const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT || 8080;
 
@@ -22,6 +22,14 @@ app.get('/', (req, res) => {
   res.send('<h1>PeerJS 信令与增强功能服务器正在运行</h1>');
 });
 
+// 【恢复】API: 获取高精度服务器时间 (uptime)
+const serverStartTime = process.hrtime.bigint();
+app.get('/get-time', (req, res) => {
+    const uptimeNanoseconds = process.hrtime.bigint() - serverStartTime;
+    const serverTimeMilliseconds = Number(uptimeNanoseconds) / 1e6;
+    res.json({ serverTime: serverTimeMilliseconds });
+});
+
 // API: 注册房间并获取短码
 app.post('/register-room', (req, res) => {
     const { longId } = req.body;
@@ -37,11 +45,30 @@ app.post('/register-room', (req, res) => {
     rooms[shortCode] = {
         host: longId,
         clients: [longId],
-        createdAt: Date.now() // 记录创建时间
+        createdAt: Date.now()
     };
 
     console.log(`[API] 房间已创建: ${shortCode} -> Host: ${longId}`);
     res.status(201).json({ shortCode });
+});
+
+// 【恢复】API: P1上报P2已连接
+app.post('/register-player2', (req, res) => {
+    const { shortCode, p2_longId } = req.body;
+    if (!shortCode || !p2_longId) {
+        return res.status(400).json({ error: '缺少 shortCode 或 p2_longId' });
+    }
+
+    const room = rooms[shortCode];
+    if (room && room.clients.length < 2 && !room.clients.includes(p2_longId)) {
+        room.clients.push(p2_longId);
+        console.log(`[Room] P2已加入房间 ${shortCode}: ${p2_longId}`);
+        res.status(200).send();
+    } else if (room) {
+         res.status(409).json({ error: '房间已满或玩家已在房间内' }); // 409 Conflict
+    } else {
+        res.status(404).json({ error: '未找到房间' });
+    }
 });
 
 // API: 通过短码查询房主ID
@@ -63,12 +90,11 @@ const server = http.createServer(app);
 // PeerServer 配置
 const peerServer = ExpressPeerServer(server, {
   debug: true,
-  // 【关键修复】明确告知 PeerServer 它在反向代理后面运行 (例如在Koyeb, Heroku, Nginx后)
+  path: '/peerjs',
   proxied: true,
-  generateClientId: uuidv4, // 使用 uuid 生成客户端ID，更可靠
+  generateClientId: uuidv4,
 });
 
-// 将 PeerServer 挂载到 /peerjs 路径
 app.use('/peerjs', peerServer);
 
 // --- PeerServer 事件监听 ---
@@ -78,15 +104,13 @@ peerServer.on('connection', (client) => {
 
 peerServer.on('disconnect', (client) => {
   const disconnectedId = client.getId();
-  if (!disconnectedId) return; // 有时ID可能为空，增加保护
+  if (!disconnectedId) return;
 
   console.log(`[PeerJS] 客户端已断开: ${disconnectedId}`);
   
-  // 遍历所有房间，查找并移除断开连接的客户端
   for (const shortCode in rooms) {
       const room = rooms[shortCode];
       if (room.clients.includes(disconnectedId)) {
-          
           if (room.host === disconnectedId) {
               console.log(`[Room] 房主 ${disconnectedId} 已断开，房间 ${shortCode} 已清理。`);
               delete rooms[shortCode];
@@ -99,7 +123,7 @@ peerServer.on('disconnect', (client) => {
   }
 });
 
-// 【增强】定期清理过期的空房间，防止内存泄漏
+// 定期清理过期的空房间
 setInterval(() => {
     const now = Date.now();
     for (const shortCode in rooms) {

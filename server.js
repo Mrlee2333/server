@@ -225,6 +225,7 @@ const peerServer = ExpressPeerServer(server, {
     debug: false, 
     proxied: true, 
     generateClientId: () => uuidv4(),
+    path: '/peerjs'
 });
 
 app.use('/peerjs', peerServer);

@@ -132,12 +132,18 @@ const io = new Server(server, {
     cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
     transports: ['polling', 'websocket'],
     allowUpgrades: true,
-    allowEIO3: false,           
+    allowEIO3: false,
     pingTimeout: 60000,
     pingInterval: 25000,
     maxHttpBufferSize: MAX_PAYLOAD_SIZE,
-    perMessageDeflate: false,
-    connectTimeout: 45000,
+
+    // ✅ 关键：完整对象形式彻底禁用，不能用 false（false 只是服务端不压缩，不能拒绝客户端提议）
+    perMessageDeflate: {
+        threshold: Infinity   // 永远不压缩，等效于彻底禁用，且在握手层拒绝扩展协商
+    },
+
+    // ✅ 同样针对 httpCompression 关掉，防止 polling 阶段的 gzip 干扰
+    httpCompression: false,
 });
 
 io.use((socket, next) => {

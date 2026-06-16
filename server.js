@@ -130,13 +130,14 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
-    transports: ['websocket'],
-    allowUpgrades: false,
-    allowEIO3: true,
+    transports: ['polling', 'websocket'],
+    allowUpgrades: true,
+    allowEIO3: false,           
     pingTimeout: 60000,
     pingInterval: 25000,
     maxHttpBufferSize: MAX_PAYLOAD_SIZE,
-    perMessageDeflate: false 
+    perMessageDeflate: false,
+    connectTimeout: 45000,
 });
 
 io.use((socket, next) => {

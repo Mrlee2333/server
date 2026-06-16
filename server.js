@@ -130,6 +130,8 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
+    transports: ['websocket'],
+    allowUpgrades: false,
     allowEIO3: true,
     pingTimeout: 60000,
     pingInterval: 25000,

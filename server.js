@@ -136,13 +136,7 @@ const io = new Server(server, {
     pingTimeout: 60000,
     pingInterval: 25000,
     maxHttpBufferSize: MAX_PAYLOAD_SIZE,
-
-    // ✅ 关键：完整对象形式彻底禁用，不能用 false（false 只是服务端不压缩，不能拒绝客户端提议）
-    perMessageDeflate: {
-        threshold: Infinity   // 永远不压缩，等效于彻底禁用，且在握手层拒绝扩展协商
-    },
-
-    // ✅ 同样针对 httpCompression 关掉，防止 polling 阶段的 gzip 干扰
+    perMessageDeflate: false, 
     httpCompression: false,
 });
 

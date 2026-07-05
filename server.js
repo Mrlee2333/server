@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { ExpressPeerServer } = require('peer');
 const { v4: uuidv4 } = require('uuid');
 const { Server } = require('socket.io'); 
+const { WebSocketServer } = require('ws');
 const xss = require('xss');             
 
 const PORT = process.env.PORT || 8080;
@@ -45,6 +46,57 @@ function parseSocketIoTransports(value) {
 
 function parseBoolean(value) {
     return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+function getRequestPath(url) {
+    try {
+        return new URL(url || '/', 'http://localhost').pathname;
+    } catch {
+        return '/';
+    }
+}
+
+function createRoutedWebSocketServer({ server, path }) {
+    const wss = new WebSocketServer({
+        noServer: true,
+        perMessageDeflate: false
+    });
+
+    server.on('upgrade', (req, socket, head) => {
+        if (getRequestPath(req.url) !== path) return;
+
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    });
+
+    return wss;
+}
+
+function disableEngineIoCompression(engineSocket) {
+    if (!engineSocket || engineSocket.__compressionDisabled) return;
+
+    const originalSendPacket = engineSocket.sendPacket.bind(engineSocket);
+    engineSocket.sendPacket = (type, data, options = {}, callback) => {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+
+        return originalSendPacket(type, data, { ...options, compress: false }, callback);
+    };
+
+    const originalWrite = engineSocket.write.bind(engineSocket);
+    engineSocket.write = (data, options = {}, callback) => {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+
+        return originalWrite(data, { ...options, compress: false }, callback);
+    };
+
+    engineSocket.__compressionDisabled = true;
 }
 
 function hashPassword(password) {
@@ -209,12 +261,16 @@ io.engine.on('connection_error', (err) => {
 });
 
 io.use((socket, next) => {
+    disableEngineIoCompression(socket.conn);
+
     const token = socket.handshake.auth.token || socket.handshake.headers['authorization'];
     if (token === `Bearer ${AUTH_KEY}` || token === AUTH_KEY) return next();
     return next(new Error('Unauthorized: Invalid Server Key'));
 });
 
 io.on('connection', (socket) => {
+    disableEngineIoCompression(socket.conn);
+
     console.log('[socket.io] connected', {
         id: socket.id,
         transport: socket.conn.transport.name,
@@ -262,7 +318,7 @@ io.on('connection', (socket) => {
         
         const safeMessage = xss(message.trim());
         if (safeMessage) {
-            io.to(shortCode).emit('chat_message', {
+            io.compress(false).to(shortCode).emit('chat_message', {
                 senderId: xss(senderId),
                 message: safeMessage,
                 timestamp: Date.now()
@@ -274,7 +330,7 @@ io.on('connection', (socket) => {
         const { shortCode, type, action, currentTime, mediaUrl, authPayload, playing } = data;
         if (!shortCode || !socket.rooms.has(shortCode)) return;
         
-        socket.volatile.to(shortCode).emit('media_sync', {
+        socket.compress(false).volatile.to(shortCode).emit('media_sync', {
             type, action, currentTime, playing,
             mediaUrl: mediaUrl ? xss(mediaUrl) : null,
             authPayload: authPayload || null,
@@ -286,7 +342,7 @@ io.on('connection', (socket) => {
         const { shortCode, ...payload } = data;
         if (!shortCode || !socket.rooms.has(shortCode)) return;
         
-        socket.to(shortCode).emit('game_sync', {
+        socket.compress(false).to(shortCode).emit('game_sync', {
             ...payload,
             timestamp: Date.now()
         });
@@ -306,7 +362,8 @@ const peerServer = ExpressPeerServer(server, {
     proxied: true, 
     generateClientId: () => uuidv4(),
     path: PEER_SERVER_PATH,
-    corsOptions
+    corsOptions,
+    createWebSocketServer: createRoutedWebSocketServer
 });
 
 app.use(PEER_MOUNT_PATH, peerServer);

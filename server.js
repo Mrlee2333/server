@@ -9,6 +9,12 @@ const xss = require('xss');
 
 const PORT = process.env.PORT || 8080;
 const AUTH_KEY = process.env.AUTH_KEY || 'YOUR_SECRET_KEY'; 
+const PEER_MOUNT_PATH = normalizePath(process.env.PEER_MOUNT_PATH || '/peerjs');
+const PEER_SERVER_PATH = normalizePath(process.env.PEER_SERVER_PATH || '/');
+const SOCKET_IO_PATH = normalizePath(process.env.SOCKET_IO_PATH || '/socket.io');
+const SOCKET_IO_TRANSPORTS = parseSocketIoTransports(process.env.SOCKET_IO_TRANSPORTS || 'websocket,polling');
+const REQUIRE_WEBSOCKET = parseBoolean(process.env.REQUIRE_WEBSOCKET || 'false');
+const WEBSOCKET_UPGRADE_TIMEOUT_MS = Number(process.env.WEBSOCKET_UPGRADE_TIMEOUT_MS || 5000);
 
 const ROOM_EMPTY_TIMEOUT_MS = 5 * 60 * 1000; 
 const ROOM_HARD_EXPIRATION_MS = 24 * 60 * 60 * 1000; 
@@ -16,6 +22,30 @@ const MAX_GLOBAL_ROOMS = 2666;
 const MAX_PAYLOAD_SIZE = 1e5; 
 
 const rooms = {};
+
+function normalizePath(path) {
+    if (!path || path === '/') return '/';
+    return `/${String(path).replace(/^\/+|\/+$/g, '')}`;
+}
+
+function buildPeerWsPath(mountPath, serverPath) {
+    const base = normalizePath(`${mountPath}${serverPath === '/' ? '' : serverPath}`);
+    return `${base === '/' ? '' : base}/peerjs`;
+}
+
+function parseSocketIoTransports(value) {
+    const allowed = new Set(['websocket', 'polling']);
+    const transports = String(value)
+        .split(',')
+        .map(transport => transport.trim())
+        .filter(transport => allowed.has(transport));
+
+    return transports.length ? transports : ['websocket', 'polling'];
+}
+
+function parseBoolean(value) {
+    return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
 
 function hashPassword(password) {
     if (!password) return '';
@@ -47,19 +77,44 @@ function generateShortCode() {
 }
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', true);
 
-const allowedOrigins = [
+const defaultAllowedOrigins = [
     "https://player.arksec.net",
     "https://game.arksec.net"
 ];
 
-app.use(cors({ origin: allowedOrigins, methods: ["GET", "POST"] }));
+const allowedOrigins = (process.env.CORS_ORIGINS || defaultAllowedOrigins.join(','))
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+
+const corsOptions = { origin: allowedOrigins, methods: ["GET", "POST"] };
+
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50kb' })); 
 
 app.get('/', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send('<h1>Nexus Backend is running Securely with Hash Auth</h1>');
+});
+
+app.get('/healthz', (req, res) => {
+    res.json({
+        ok: true,
+        uptime: process.uptime(),
+        peer: {
+            mountPath: PEER_MOUNT_PATH,
+            serverPath: PEER_SERVER_PATH,
+            websocketPath: buildPeerWsPath(PEER_MOUNT_PATH, PEER_SERVER_PATH)
+        },
+        socketio: {
+            path: SOCKET_IO_PATH,
+            transports: SOCKET_IO_TRANSPORTS,
+            requireWebsocket: REQUIRE_WEBSOCKET,
+            websocketUpgradeTimeoutMs: WEBSOCKET_UPGRADE_TIMEOUT_MS
+        }
+    });
 });
 
 const serverStartTime = process.hrtime.bigint();
@@ -129,8 +184,9 @@ app.get('/get-room/:shortCode', (req, res) => {
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
-    transports: ['polling', 'websocket'],
+    path: SOCKET_IO_PATH,
+    cors: corsOptions,
+    transports: SOCKET_IO_TRANSPORTS,
     allowUpgrades: true,
     allowEIO3: false,
     pingTimeout: 60000,
@@ -140,6 +196,18 @@ const io = new Server(server, {
     httpCompression: false,
 });
 
+io.engine.on('connection_error', (err) => {
+    console.warn('[socket.io] connection_error', {
+        code: err.code,
+        message: err.message,
+        context: err.context,
+        origin: err.req?.headers?.origin,
+        url: err.req?.url,
+        forwardedProto: err.req?.headers?.['x-forwarded-proto'],
+        forwardedHost: err.req?.headers?.['x-forwarded-host']
+    });
+});
+
 io.use((socket, next) => {
     const token = socket.handshake.auth.token || socket.handshake.headers['authorization'];
     if (token === `Bearer ${AUTH_KEY}` || token === AUTH_KEY) return next();
@@ -147,6 +215,31 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
+    console.log('[socket.io] connected', {
+        id: socket.id,
+        transport: socket.conn.transport.name,
+        origin: socket.handshake.headers.origin
+    });
+
+    socket.conn.once('upgrade', (transport) => {
+        console.log('[socket.io] upgraded', {
+            id: socket.id,
+            transport: transport.name
+        });
+    });
+
+    if (REQUIRE_WEBSOCKET && socket.conn.transport.name !== 'websocket') {
+        setTimeout(() => {
+            if (socket.connected && socket.conn.transport.name !== 'websocket') {
+                console.warn('[socket.io] disconnecting non-websocket transport', {
+                    id: socket.id,
+                    transport: socket.conn.transport.name
+                });
+                socket.disconnect(true);
+            }
+        }, WEBSOCKET_UPGRADE_TIMEOUT_MS);
+    }
+
     socket.on('join_room', (data) => {
         if (!data || typeof data !== 'object') return;
         const { shortCode, roomPassword } = data;
@@ -181,7 +274,7 @@ io.on('connection', (socket) => {
         const { shortCode, type, action, currentTime, mediaUrl, authPayload, playing } = data;
         if (!shortCode || !socket.rooms.has(shortCode)) return;
         
-        socket.to(shortCode).emit('media_sync', {
+        socket.volatile.to(shortCode).emit('media_sync', {
             type, action, currentTime, playing,
             mediaUrl: mediaUrl ? xss(mediaUrl) : null,
             authPayload: authPayload || null,
@@ -212,10 +305,11 @@ const peerServer = ExpressPeerServer(server, {
     debug: false, 
     proxied: true, 
     generateClientId: () => uuidv4(),
-    path: '/peerjs'
+    path: PEER_SERVER_PATH,
+    corsOptions
 });
 
-app.use('/peerjs', peerServer);
+app.use(PEER_MOUNT_PATH, peerServer);
 
 setInterval(() => {
     const now = Date.now();
@@ -242,4 +336,11 @@ setInterval(() => {
     }
 }, 15 * 1000); 
 
-server.listen(PORT, '0.0.0.0');
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on 0.0.0.0:${PORT}`);
+    console.log(`PeerJS HTTP base: ${PEER_MOUNT_PATH}${PEER_SERVER_PATH === '/' ? '' : PEER_SERVER_PATH}`);
+    console.log(`PeerJS WebSocket path: ${buildPeerWsPath(PEER_MOUNT_PATH, PEER_SERVER_PATH)}`);
+    console.log(`Socket.IO path: ${SOCKET_IO_PATH}`);
+    console.log(`Socket.IO transports: ${SOCKET_IO_TRANSPORTS.join(',')}`);
+    console.log(`Require WebSocket: ${REQUIRE_WEBSOCKET}`);
+});

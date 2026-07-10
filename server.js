@@ -299,17 +299,21 @@ io.on('connection', (socket) => {
     socket.on('join_room', (data) => {
         if (!data || typeof data !== 'object') return;
         const { shortCode, roomPassword } = data;
-        
+
         const room = rooms[shortCode];
         if (!room) return;
 
         if (room.pwdHash !== hashPassword(roomPassword)) {
-            return; 
+            return;
         }
 
         socket.join(shortCode);
         room.activeSockets.add(socket.id);
-        room.emptySince = null; 
+        room.emptySince = null;
+
+        if (data.peerId) {
+            socket.to(shortCode).emit('peer_joined', { peerId: xss(data.peerId) });
+        }
     });
 
     socket.on('chat_message', (data) => {
@@ -341,9 +345,29 @@ io.on('connection', (socket) => {
     socket.on('game_sync', (data) => {
         const { shortCode, ...payload } = data;
         if (!shortCode || !socket.rooms.has(shortCode)) return;
-        
+
         socket.compress(false).to(shortCode).emit('game_sync', {
             ...payload,
+            timestamp: Date.now()
+        });
+    });
+
+    socket.on('voice_signal', (data) => {
+        const { shortCode } = data;
+        if (!shortCode || !socket.rooms.has(shortCode)) return;
+        socket.to(shortCode).emit('voice_signal', {
+            action: data.action,
+            peerId: data.peerId,
+            timestamp: Date.now()
+        });
+    });
+
+    socket.on('screen_share_signal', (data) => {
+        const { shortCode } = data;
+        if (!shortCode || !socket.rooms.has(shortCode)) return;
+        socket.to(shortCode).emit('screen_share_signal', {
+            action: data.action,
+            peerId: data.peerId,
             timestamp: Date.now()
         });
     });

@@ -16,9 +16,9 @@ const HIT_PROTECTION_MS = 110;
 
 const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
-    bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 27 },
-    pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 24 },
-    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 32 }
+    bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 38 },
+    pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 34 },
+    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 42 }
 });
 const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multishot', 'pierce', 'lifesteal', 'dash']);
 

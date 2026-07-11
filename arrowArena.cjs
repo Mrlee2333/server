@@ -473,6 +473,13 @@ function attachArrowArena({ app, io, authKey }) {
             if (Object.hasOwn(WEAPONS, data.weapon)) player.weapon = data.weapon;
         });
 
+        socket.on('arena_ping', (_data, acknowledge) => {
+            const now = Date.now();
+            if (now - (socket.data.lastArenaPingAt || 0) < 400 || typeof acknowledge !== 'function') return;
+            socket.data.lastArenaPingAt = now;
+            acknowledge({ serverTime: now });
+        });
+
         socket.on('disconnect', () => {
             markPlayerOffline(socket);
             if (activeIdentities.get(identityId) === socket.id) activeIdentities.delete(identityId);

@@ -8,12 +8,16 @@ const TICK_MS = 50;
 const SNAPSHOT_MS = 1000 / 15;
 const OFFLINE_GRACE_MS = 3 * 60 * 1000;
 const EMPTY_ROOM_TTL_MS = 10_000;
+const DASH_COOLDOWN_MS = 1800;
+const DASH_ENERGY = 20;
+const ENERGY_REGEN_PER_SECOND = 5;
+const HIT_PROTECTION_MS = 110;
 
 const WEAPONS = Object.freeze({
-    sword: { damage: 44, cooldown: 480, range: 112, speed: 0, life: 0, pierce: 0 },
-    bow: { damage: 27, cooldown: 620, range: 780, speed: 720, life: 1200, pierce: 0 },
-    pistol: { damage: 14, cooldown: 230, range: 850, speed: 1050, life: 850, pierce: 0 },
-    pulse: { damage: 36, cooldown: 510, range: 760, speed: 690, life: 1200, pierce: 2, energy: 8 }
+    sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
+    bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 27 },
+    pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 24 },
+    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 32 }
 });
 
 function clamp(value, min, max) {
@@ -24,8 +28,23 @@ function finiteNumber(value, fallback = 0) {
     return Number.isFinite(value) ? value : fallback;
 }
 
-function cleanName(value) {
-    return String(value || '像素勇士').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 12) || '像素勇士';
+function pointSegmentDistanceSq(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lengthSq = dx * dx + dy * dy;
+    if (lengthSq <= 0.0001) return (px - x1) ** 2 + (py - y1) ** 2;
+    const t = clamp(((px - x1) * dx + (py - y1) * dy) / lengthSq, 0, 1);
+    const nearestX = x1 + dx * t;
+    const nearestY = y1 + dy * t;
+    return (px - nearestX) ** 2 + (py - nearestY) ** 2;
+}
+
+function randomPlayerName() {
+    const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const digits = '23456789';
+    let suffix = '';
+    for (let i = 0; i < 3; i++) suffix += letters[crypto.randomInt(letters.length)] + digits[crypto.randomInt(digits.length)];
+    return `PX${suffix}`;
 }
 
 function cleanRoomCode(value) {
@@ -95,15 +114,32 @@ function createRoom(code) {
     };
 }
 
+function chooseSpawn(room) {
+    let best = { x: WORLD_W / 2, y: WORLD_H / 2, distanceSq: -1 };
+    for (let attempt = 0; attempt < 16; attempt++) {
+        const x = crypto.randomInt(120, WORLD_W - 120);
+        const y = crypto.randomInt(120, WORLD_H - 120);
+        let nearestSq = Number.POSITIVE_INFINITY;
+        for (const other of room.players.values()) {
+            if (!other.alive || other.offlineAt) continue;
+            const dx = other.x - x;
+            const dy = other.y - y;
+            nearestSq = Math.min(nearestSq, dx * dx + dy * dy);
+        }
+        if (nearestSq > best.distanceSq) best = { x, y, distanceSq: nearestSq };
+        if (nearestSq >= 520 * 520) break;
+    }
+    return best;
+}
+
 function createPlayer(identity, socket, room) {
-    const slot = room.players.size;
-    const angle = slot / 6 * Math.PI * 2;
+    const spawn = chooseSpawn(room);
     return {
         id: identity.id,
         socketId: socket.id,
         name: identity.name,
-        x: WORLD_W / 2 + Math.cos(angle) * 260,
-        y: WORLD_H / 2 + Math.sin(angle) * 220,
+        x: spawn.x,
+        y: spawn.y,
         vx: 0, vy: 0, aimX: 1, aimY: 0,
         dashX: 1, dashY: 0,
         hp: 125, maxHp: 125, energy: 100,
@@ -120,15 +156,21 @@ function createPlayer(identity, socket, room) {
 function getProjectile(room) {
     for (const projectile of room.projectiles) if (!projectile.active) return projectile;
     if (room.projectiles.length >= 96) return null;
-    const projectile = { active: false, id: 0, ownerId: '', x: 0, y: 0, vx: 0, vy: 0, damage: 0, expiresAt: 0, weapon: 'bow', pierce: 0 };
+    const projectile = { active: false, id: 0, ownerId: '', x: 0, y: 0, vx: 0, vy: 0, damage: 0, expiresAt: 0, weapon: 'bow', pierce: 0, hitRadius: 27, hitIds: new Set() };
     room.projectiles.push(projectile);
     return projectile;
+}
+
+function deactivateProjectile(projectile) {
+    projectile.active = false;
+    projectile.ownerId = '';
+    projectile.hitIds.clear();
 }
 
 function damagePlayer(room, target, owner, damage, now) {
     if (!target.alive || now < target.invulnerableUntil) return;
     target.hp = Math.max(0, target.hp - damage);
-    target.invulnerableUntil = now + 300;
+    target.invulnerableUntil = now + HIT_PROTECTION_MS;
     if (target.hp > 0) return;
     target.alive = false;
     target.state = 'dead';
@@ -173,13 +215,14 @@ function useWeapon(room, player, now) {
     projectile.expiresAt = now + weapon.life;
     projectile.weapon = player.weapon;
     projectile.pierce = weapon.pierce;
+    projectile.hitRadius = weapon.hitRadius;
+    projectile.hitIds.clear();
 }
 
-function respawnPlayer(player, now) {
-    const seed = crypto.randomInt(0, 8);
-    const angle = seed / 8 * Math.PI * 2;
-    player.x = WORLD_W / 2 + Math.cos(angle) * 420;
-    player.y = WORLD_H / 2 + Math.sin(angle) * 320;
+function respawnPlayer(room, player, now) {
+    const spawn = chooseSpawn(room);
+    player.x = spawn.x;
+    player.y = spawn.y;
     player.vx = player.vy = 0;
     player.hp = player.maxHp;
     player.energy = 100;
@@ -193,17 +236,17 @@ function simulateRoom(room, now, dt) {
     for (const player of room.players.values()) {
         if (player.offlineAt) continue;
         if (!player.alive) {
-            if (player.respawnAt && now >= player.respawnAt) respawnPlayer(player, now);
+            if (player.respawnAt && now >= player.respawnAt) respawnPlayer(room, player, now);
             continue;
         }
 
         const input = player.input;
         if (input.dash) {
             input.dash = false;
-            if (now - player.lastDash >= 1000 && player.energy >= 25) {
+            if (now - player.lastDash >= DASH_COOLDOWN_MS && player.energy >= DASH_ENERGY) {
                 player.lastDash = now;
                 player.dashUntil = now + 190;
-                player.energy -= 25;
+                player.energy -= DASH_ENERGY;
                 const hasMove = Math.abs(input.moveX) + Math.abs(input.moveY) > 0.05;
                 player.dashX = hasMove ? input.moveX : player.aimX;
                 player.dashY = hasMove ? input.moveY : player.aimY;
@@ -222,25 +265,25 @@ function simulateRoom(room, now, dt) {
 
         player.x = clamp(player.x + player.vx * dt, 35, WORLD_W - 35);
         player.y = clamp(player.y + player.vy * dt, 35, WORLD_H - 35);
-        player.energy = Math.min(100, player.energy + 2.5 * dt);
+        player.energy = Math.min(100, player.energy + ENERGY_REGEN_PER_SECOND * dt);
         if (input.shooting) useWeapon(room, player, now);
     }
 
     for (const projectile of room.projectiles) {
         if (!projectile.active) continue;
-        if (now >= projectile.expiresAt) { projectile.active = false; continue; }
+        if (now >= projectile.expiresAt) { deactivateProjectile(projectile); continue; }
+        const previousX = projectile.x;
+        const previousY = projectile.y;
         projectile.x += projectile.vx * dt;
         projectile.y += projectile.vy * dt;
-        if (projectile.x < 0 || projectile.y < 0 || projectile.x > WORLD_W || projectile.y > WORLD_H) { projectile.active = false; continue; }
+        if (projectile.x < 0 || projectile.y < 0 || projectile.x > WORLD_W || projectile.y > WORLD_H) { deactivateProjectile(projectile); continue; }
         const owner = room.players.get(projectile.ownerId);
         for (const target of room.players.values()) {
-            if (!target.alive || target.id === projectile.ownerId) continue;
-            const dx = target.x - projectile.x;
-            const dy = target.y - projectile.y;
-            if (dx * dx + dy * dy > 28 * 28) continue;
+            if (!target.alive || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
+            if (pointSegmentDistanceSq(target.x, target.y, previousX, previousY, projectile.x, projectile.y) > projectile.hitRadius * projectile.hitRadius) continue;
+            projectile.hitIds.add(target.id);
             damagePlayer(room, target, owner, projectile.damage, now);
-            if (projectile.pierce-- <= 0) projectile.active = false;
-            break;
+            if (projectile.pierce-- <= 0) { deactivateProjectile(projectile); break; }
         }
     }
 }
@@ -296,10 +339,11 @@ function attachArrowArena({ app, io, authKey }) {
         const ipKey = fingerprint(ip, secret);
         const browserKey = fingerprint(`${ipKey}:${browserId}`, secret);
         let cached = browserIdentities.get(browserKey);
-        if (!cached || now - cached.lastSeen > 30 * 60_000) cached = { playerId: crypto.randomUUID(), lastSeen: now };
+        if (!cached || now - cached.lastSeen > 30 * 60_000) cached = { playerId: crypto.randomUUID(), playerName: randomPlayerName(), lastSeen: now };
+        if (!cached.playerName) cached.playerName = randomPlayerName();
         cached.lastSeen = now;
         browserIdentities.set(browserKey, cached);
-        const identity = { id: cached.playerId, name: cleanName(req.body?.name), ipKey, browserKey, exp: now + 30 * 60_000 };
+        const identity = { id: cached.playerId, name: cached.playerName, ipKey, browserKey, exp: now + 30 * 60_000 };
         res.json({ token: signTicket(identity, secret), playerId: identity.id, name: identity.name, namespace: '/arrow-arena' });
     });
 

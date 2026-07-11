@@ -25,8 +25,8 @@ const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multis
 const WEAPON_TO_IDX = { sword: 0, bow: 1, pistol: 2, pulse: 3 };
 const STATE_TO_IDX = { idle: 0, move: 1, attack: 2, dead: 3, offline: 4 };
 
-const AOI_CELL_W = 650;
-const AOI_CELL_H = 600;
+const AOI_CELL_W = 1300;
+const AOI_CELL_H = 900;
 const AOI_COLS = Math.ceil(WORLD_W / AOI_CELL_W);
 const AOI_ROWS = Math.ceil(WORLD_H / AOI_CELL_H);
 

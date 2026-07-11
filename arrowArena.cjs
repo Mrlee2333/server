@@ -7,6 +7,7 @@ const WORLD_H = 1800;
 const TICK_MS = 1000 / 30;
 const SNAPSHOT_MS = 1000 / 20;
 const OFFLINE_GRACE_MS = 3 * 60 * 1000;
+const MAX_TOTAL_PLAYERS = 160;
 const EMPTY_ROOM_TTL_MS = 10_000;
 const DASH_COOLDOWN_MS = 1800;
 const DASH_ENERGY = 20;
@@ -20,6 +21,118 @@ const WEAPONS = Object.freeze({
     pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 32 }
 });
 const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multishot', 'pierce', 'lifesteal', 'dash']);
+
+const WEAPON_TO_IDX = { sword: 0, bow: 1, pistol: 2, pulse: 3 };
+const STATE_TO_IDX = { idle: 0, move: 1, attack: 2, dead: 3, offline: 4 };
+
+const AOI_CELL_W = 650;
+const AOI_CELL_H = 600;
+const AOI_COLS = Math.ceil(WORLD_W / AOI_CELL_W);
+const AOI_ROWS = Math.ceil(WORLD_H / AOI_CELL_H);
+
+function aoiCell(x, y) {
+    return clamp(Math.floor(x / AOI_CELL_W), 0, AOI_COLS - 1)
+         + clamp(Math.floor(y / AOI_CELL_H), 0, AOI_ROWS - 1) * AOI_COLS;
+}
+
+const _aoiCache = new Map();
+function aoiVisible(cell) {
+    if (_aoiCache.has(cell)) return _aoiCache.get(cell);
+    const col = cell % AOI_COLS, row = (cell - col) / AOI_COLS;
+    const s = new Set();
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        const c = col + dc, r = row + dr;
+        if (c >= 0 && c < AOI_COLS && r >= 0 && r < AOI_ROWS) s.add(c + r * AOI_COLS);
+    }
+    _aoiCache.set(cell, s);
+    return s;
+}
+
+const BIT_VEL = 1, BIT_AIM = 2, BIT_HP = 4, BIT_NRG = 8, BIT_WS = 16, BIT_SCORE = 32, BIT_COMBAT = 64;
+const _snapBuf = Buffer.allocUnsafe(16384);
+
+function snapVals(p) {
+    return {
+        x: Math.round(p.x), y: Math.round(p.y),
+        vx: Math.round(p.vx), vy: Math.round(p.vy),
+        ax: Math.round(p.aimX * 127), ay: Math.round(p.aimY * 127),
+        hp: Math.round(p.hp), mhp: Math.round(p.maxHp),
+        nrg: Math.round(p.energy),
+        w: WEAPON_TO_IDX[p.weapon] ?? 1, st: STATE_TO_IDX[p.state] ?? 0,
+        k: p.kills, d: p.deaths, seq: p.lastInputSeq, lv: p.level,
+        spd: Math.round(p.speed * 10), cd: Math.round(p.cooldownScale * 255),
+        ms: p.multishot, pb: p.pierceBonus
+    };
+}
+
+function deltaM(cur, prev) {
+    let m = 0;
+    if (cur.vx !== prev.vx || cur.vy !== prev.vy) m |= BIT_VEL;
+    if (cur.ax !== prev.ax || cur.ay !== prev.ay) m |= BIT_AIM;
+    if (cur.hp !== prev.hp || cur.mhp !== prev.mhp) m |= BIT_HP;
+    if (cur.nrg !== prev.nrg) m |= BIT_NRG;
+    if (cur.w !== prev.w || cur.st !== prev.st) m |= BIT_WS;
+    if (cur.k !== prev.k || cur.d !== prev.d) m |= BIT_SCORE;
+    if (cur.seq !== prev.seq || cur.lv !== prev.lv || cur.spd !== prev.spd ||
+        cur.cd !== prev.cd || cur.ms !== prev.ms || cur.pb !== prev.pb) m |= BIT_COMBAT;
+    return m;
+}
+
+function writeFields(buf, o, v, mask) {
+    if (mask & BIT_VEL) { buf.writeInt16BE(clamp(v.vx, -32768, 32767), o); o += 2; buf.writeInt16BE(clamp(v.vy, -32768, 32767), o); o += 2; }
+    if (mask & BIT_AIM) { buf.writeInt8(clamp(v.ax, -127, 127), o); o += 1; buf.writeInt8(clamp(v.ay, -127, 127), o); o += 1; }
+    if (mask & BIT_HP) { buf.writeUInt16BE(v.hp, o); o += 2; buf.writeUInt16BE(v.mhp, o); o += 2; }
+    if (mask & BIT_NRG) { buf.writeUInt8(v.nrg, o); o += 1; }
+    if (mask & BIT_WS) { buf.writeUInt8(v.w, o); o += 1; buf.writeUInt8(v.st, o); o += 1; }
+    if (mask & BIT_SCORE) { buf.writeUInt16BE(v.k, o); o += 2; buf.writeUInt16BE(v.d, o); o += 2; }
+    if (mask & BIT_COMBAT) {
+        buf.writeUInt32BE(v.seq >>> 0, o); o += 4; buf.writeUInt8(v.lv, o); o += 1;
+        buf.writeUInt16BE(v.spd, o); o += 2; buf.writeUInt8(v.cd, o); o += 1;
+        buf.writeUInt8(v.ms, o); o += 1; buf.writeUInt8(v.pb, o); o += 1;
+    }
+    return o;
+}
+
+function encodeSnapshot(room, viewer, visPlayers, visProjs, removedIndices, now, full) {
+    const buf = _snapBuf;
+    let o = 0;
+    buf.writeDoubleBE(now, o); o += 8;
+    buf.writeUInt8(full ? 1 : 0, o); o += 1;
+    buf.writeUInt8(visPlayers.length, o); o += 1;
+    for (const p of visPlayers) {
+        const idx = room.playerIndexMap.get(p.id);
+        if (idx === undefined) continue;
+        const cur = snapVals(p);
+        buf.writeUInt8(idx, o); o += 1;
+        buf.writeUInt16BE(clamp(cur.x, 0, 65535), o); o += 2;
+        buf.writeUInt16BE(clamp(cur.y, 0, 65535), o); o += 2;
+        const prev = full ? null : viewer._delta?.get(idx);
+        const mask = prev ? deltaM(cur, prev) : 0x7F;
+        buf.writeUInt8(mask, o); o += 1;
+        o = writeFields(buf, o, cur, mask);
+        if (!viewer._delta) viewer._delta = new Map();
+        viewer._delta.set(idx, cur);
+    }
+    buf.writeUInt8(Math.min(visProjs.length, 96), o); o += 1;
+    let projCount = 0;
+    for (const pr of visProjs) {
+        if (projCount >= 96) break;
+        const ownerIdx = room.playerIndexMap.get(pr.ownerId);
+        buf.writeUInt16BE(pr.id & 0xFFFF, o); o += 2;
+        buf.writeUInt16BE(Math.round(clamp(pr.x, 0, 65535)), o); o += 2;
+        buf.writeUInt16BE(Math.round(clamp(pr.y, 0, 65535)), o); o += 2;
+        buf.writeInt16BE(Math.round(clamp(pr.vx, -32768, 32767)), o); o += 2;
+        buf.writeInt16BE(Math.round(clamp(pr.vy, -32768, 32767)), o); o += 2;
+        buf.writeUInt8(WEAPON_TO_IDX[pr.weapon] ?? 1, o); o += 1;
+        buf.writeUInt8(ownerIdx ?? 255, o); o += 1;
+        projCount++;
+    }
+    buf.writeUInt8(removedIndices.length, o); o += 1;
+    for (const ri of removedIndices) { buf.writeUInt8(ri, o); o += 1; }
+    const result = Buffer.allocUnsafe(o);
+    buf.copy(result, 0, 0, o);
+    return result;
+}
 
 function offerUpgrade(room, player) {
     if (player.pendingUpgrades?.length || !player.socketId) return;
@@ -142,7 +255,10 @@ function createRoom(code) {
         nextCombatEventId: 1,
         createdAt: Date.now(),
         emptyAt: 0,
-        snapshotAt: 0
+        snapshotAt: 0,
+        snapshotSeq: 0,
+        playerIndexMap: new Map(),
+        indexToPlayer: new Map()
     };
 }
 
@@ -184,7 +300,8 @@ function createPlayer(identity, socket, room) {
         dashUntil: 0, invulnerableUntil: Date.now() + 1000, respawnAt: 0,
         offlineAt: 0,
         inputWindowAt: Date.now(), inputCount: 0, strikes: 0,
-        input: { moveX: 0, moveY: 0, aimX: 1, aimY: 0, shooting: false, dash: false }
+        input: { moveX: 0, moveY: 0, aimX: 1, aimY: 0, shooting: false, dash: false },
+        _delta: new Map()
     };
 }
 
@@ -390,6 +507,12 @@ function attachArrowArena({ app, io, authKey }) {
         return count;
     }
 
+    function getTotalOnlineCount() {
+        let count = 0;
+        for (const room of rooms.values()) count += getOnlinePlayerCount(room);
+        return count;
+    }
+
     function makeRoomState(room) {
         return { roomCode: room.code, playerCount: getOnlinePlayerCount(room), maxPlayers };
     }
@@ -398,11 +521,42 @@ function attachArrowArena({ app, io, authKey }) {
         arena.to(room.code).emit('arena_room_state', makeRoomState(room));
     }
 
+    function assignPlayerIndex(room, playerId) {
+        if (room.playerIndexMap.has(playerId)) return room.playerIndexMap.get(playerId);
+        for (let i = 0; i < 255; i++) {
+            if (!room.indexToPlayer.has(i)) {
+                room.indexToPlayer.set(i, playerId);
+                room.playerIndexMap.set(playerId, i);
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function releasePlayerIndex(room, playerId) {
+        const idx = room.playerIndexMap.get(playerId);
+        if (idx !== undefined) {
+            room.indexToPlayer.delete(idx);
+            room.playerIndexMap.delete(playerId);
+            for (const p of room.players.values()) if (p._delta) p._delta.delete(idx);
+        }
+    }
+
+    function getPlayerMapEntries(room) {
+        const entries = [];
+        for (const [idx, pid] of room.indexToPlayer) {
+            const p = room.players.get(pid);
+            if (p) entries.push({ index: idx, id: p.id, name: p.name });
+        }
+        return entries;
+    }
+
     app.get('/arrow-arena/health', (_req, res) => res.json({
         ok: true,
         rooms: rooms.size,
         players: Array.from(rooms.values()).reduce((sum, room) => sum + room.players.size, 0),
-        onlinePlayers: Array.from(rooms.values()).reduce((sum, room) => sum + Array.from(room.players.values()).filter(player => !player.offlineAt).length, 0),
+        onlinePlayers: getTotalOnlineCount(),
+        maxTotalPlayers: MAX_TOTAL_PLAYERS,
         tickRate: Math.round(1000 / TICK_MS),
         snapshotRate: Math.round(1000 / SNAPSHOT_MS),
         maxRooms,
@@ -424,8 +578,6 @@ function attachArrowArena({ app, io, authKey }) {
         // 浏览器身份不能绑定 IP：移动网络切换、双栈出口变化和代理漂移都会让
         // Socket.IO 重连被误判成新设备，表现为游戏无故掉线。
         const browserKey = fingerprint(browserId, secret);
-        const activeSocketId = activeBrowsers.get(browserKey);
-        if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return res.status(409).json({ error: '此浏览器已有游戏窗口在线，请关闭后再试' });
         let cached = browserIdentities.get(browserKey);
         if (!cached) cached = { playerId: crypto.randomBytes(18).toString('base64url'), playerName: uniquePlayerName(browserIdentities), lastSeen: now };
         cached.lastSeen = now;
@@ -439,8 +591,8 @@ function attachArrowArena({ app, io, authKey }) {
         if (!identity) return next(new Error('Invalid or expired game ticket'));
         const currentIpKey = fingerprint(socketIp(socket), secret);
         const activeSocketId = activeBrowsers.get(identity.browserKey);
-        if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return next(new Error('This browser already has an active game window'));
-        if ((activeIpCounts.get(currentIpKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
+        const isReconnect = activeSocketId && arena.sockets.get(activeSocketId)?.connected;
+        if (!isReconnect && (activeIpCounts.get(currentIpKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
         socket.data.arenaIdentity = { ...identity, ipKey: currentIpKey };
         next();
     });
@@ -450,12 +602,13 @@ function attachArrowArena({ app, io, authKey }) {
         if (!code) return;
         const room = rooms.get(code);
         if (room) {
+            releasePlayerIndex(room, socket.data.arenaIdentity.id);
             room.players.delete(socket.data.arenaIdentity.id);
             if (room.players.size === 0) room.emptyAt = Date.now();
         }
         socket.leave(code);
         socket.data.arenaRoom = '';
-        if (room) broadcastRoomState(room);
+        if (room) { broadcastRoomState(room); arena.to(code).emit('arena_player_map', getPlayerMapEntries(room)); }
     }
 
     function markPlayerOffline(socket) {
@@ -503,32 +656,47 @@ function attachArrowArena({ app, io, authKey }) {
                 existingRoom.emptyAt = 0;
                 socket.data.arenaRoom = existingRoom.code;
                 socket.join(existingRoom.code);
+                assignPlayerIndex(existingRoom, existingPlayer.id);
+                arena.to(socket.id).emit('arena_player_map', getPlayerMapEntries(existingRoom));
                 const roomState = makeRoomState(existingRoom);
                 broadcastRoomState(existingRoom);
                 if (existingPlayer.pendingUpgrades?.length) setTimeout(() => existingRoom.arena?.to(existingPlayer.socketId).emit('arena_upgrade_choices', { choices: existingPlayer.pendingUpgrades, level: existingPlayer.level }), 250);
                 return acknowledge({ ok: true, roomCode: existingRoom.code, playerId: existingPlayer.id, ...roomState, reconnected: true });
             }
+            if (getTotalOnlineCount() >= MAX_TOTAL_PLAYERS) {
+                return acknowledge({ ok: false, error: '服务器已满（当前在线 ' + MAX_TOTAL_PLAYERS + ' 人），请稍后再试' });
+            }
             let code = cleanRoomCode(data.roomCode);
             let room = code ? rooms.get(code) : null;
             if (!room && !code) {
+                let bestRoom = null;
+                let bestCount = -1;
                 for (const candidate of rooms.values()) {
-                    if (candidate.players.size < maxPlayers) { room = candidate; break; }
+                    const online = getOnlinePlayerCount(candidate);
+                    if (online < maxPlayers && online > bestCount) {
+                        bestRoom = candidate;
+                        bestCount = online;
+                    }
                 }
+                room = bestRoom;
             }
             if (!room) {
-                if (rooms.size >= maxRooms) return acknowledge({ ok: false, error: '联机房间已满' });
+                if (rooms.size >= maxRooms) return acknowledge({ ok: false, error: '服务器已满，请稍后再试' });
                 code = code || randomCode(rooms);
                 if (!code) return acknowledge({ ok: false, error: '无法创建房间' });
                 room = createRoom(code);
                 room.arena = arena;
                 rooms.set(code, room);
             }
-            if (room.players.size >= maxPlayers) return acknowledge({ ok: false, error: '房间人数已满' });
+            if (getOnlinePlayerCount(room) >= maxPlayers) return acknowledge({ ok: false, error: '房间人数已满（' + maxPlayers + '/' + maxPlayers + '）' });
             const player = createPlayer(socket.data.arenaIdentity, socket, room);
             room.players.set(player.id, player);
+            assignPlayerIndex(room, player.id);
             room.emptyAt = 0;
             socket.data.arenaRoom = room.code;
             socket.join(room.code);
+            arena.to(socket.id).emit('arena_player_map', getPlayerMapEntries(room));
+            arena.to(room.code).emit('arena_player_map', [{ index: room.playerIndexMap.get(player.id), id: player.id, name: player.name }]);
             const roomState = makeRoomState(room);
             broadcastRoomState(room);
             acknowledge({ ok: true, roomCode: room.code, playerId: player.id, ...roomState });
@@ -610,7 +778,10 @@ function attachArrowArena({ app, io, authKey }) {
         previous = now;
         for (const [code, room] of rooms) {
             for (const [playerId, player] of room.players) {
-                if (player.offlineAt && now - player.offlineAt >= OFFLINE_GRACE_MS) room.players.delete(playerId);
+                if (player.offlineAt && now - player.offlineAt >= OFFLINE_GRACE_MS) {
+                    releasePlayerIndex(room, playerId);
+                    room.players.delete(playerId);
+                }
             }
             if (room.players.size === 0) {
                 if (!room.emptyAt) room.emptyAt = now;
@@ -620,7 +791,54 @@ function attachArrowArena({ app, io, authKey }) {
             simulateRoom(room, now, dt);
             if (now - room.snapshotAt >= SNAPSHOT_MS) {
                 room.snapshotAt = now;
-                arena.to(code).volatile.emit('arena_snapshot', makeSnapshot(room, now));
+                room.snapshotSeq = (room.snapshotSeq || 0) + 1;
+                const isFull = room.snapshotSeq % 60 === 0;
+
+                const cellPlayers = new Map();
+                const cellProjs = new Map();
+                for (const p of room.players.values()) {
+                    if (p.offlineAt) continue;
+                    const c = aoiCell(p.x, p.y);
+                    let arr = cellPlayers.get(c);
+                    if (!arr) { arr = []; cellPlayers.set(c, arr); }
+                    arr.push(p);
+                }
+                for (const pr of room.projectiles) {
+                    if (!pr.active) continue;
+                    const c = aoiCell(pr.x, pr.y);
+                    let arr = cellProjs.get(c);
+                    if (!arr) { arr = []; cellProjs.set(c, arr); }
+                    arr.push(pr);
+                }
+
+                for (const viewer of room.players.values()) {
+                    if (!viewer.socketId || viewer.offlineAt) continue;
+                    const visCells = aoiVisible(aoiCell(viewer.x, viewer.y));
+                    const visPlayers = [];
+                    const visIdxSet = new Set();
+                    for (const cell of visCells) {
+                        const ps = cellPlayers.get(cell);
+                        if (ps) for (const p of ps) {
+                            visPlayers.push(p);
+                            const idx = room.playerIndexMap.get(p.id);
+                            if (idx !== undefined) visIdxSet.add(idx);
+                        }
+                    }
+                    const visProjs = [];
+                    for (const cell of visCells) {
+                        const ps = cellProjs.get(cell);
+                        if (ps) for (const pr of ps) visProjs.push(pr);
+                    }
+                    const removed = [];
+                    if (!isFull && viewer._delta) {
+                        for (const prevIdx of viewer._delta.keys()) {
+                            if (!visIdxSet.has(prevIdx)) { removed.push(prevIdx); viewer._delta.delete(prevIdx); }
+                        }
+                    }
+                    if (isFull && viewer._delta) viewer._delta.clear();
+                    const buf = encodeSnapshot(room, viewer, visPlayers, visProjs, removed, now, isFull);
+                    arena.to(viewer.socketId).volatile.emit('arena_snapshot', buf);
+                }
             }
         }
         if (sessionRates.size > 2048) sessionRates.clear();

@@ -1,21 +1,22 @@
 {
-  "name": "peerjs-server",
+  "name": "nexus-arrow-arena-backend",
+  "private": true,
   "version": "1.0.0",
-  "description": "PeerJS server",
-  "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "peer": "^1.0.2",
-    "uuid": "^11.1.0",
-    "socket.io": "^4.8.3",
-    "xss": "^1.0.15"
-    
+    "start": "node server.js",
+    "check": "node --check server.js && node --check arrowArena.cjs"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "peer": "^1.0.2",
+    "socket.io": "^4.8.3",
+    "uuid": "^14.0.1",
+    "ws": "^8.21.0",
+    "xss": "^1.0.15"
   }
 }

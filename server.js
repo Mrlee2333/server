@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const { Server } = require('socket.io'); 
 const { WebSocketServer } = require('ws');
 const xss = require('xss');             
+const { attachArrowArena } = require('./arrowArena.cjs');
 
 const PORT = process.env.PORT || 8080;
 const AUTH_KEY = process.env.AUTH_KEY || 'YOUR_SECRET_KEY'; 
@@ -133,7 +134,9 @@ app.set('trust proxy', true);
 
 const defaultAllowedOrigins = [
     "https://player.arksec.net",
-    "https://game.arksec.net"
+    "https://game.arksec.net",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
 ];
 
 const allowedOrigins = (process.env.CORS_ORIGINS || defaultAllowedOrigins.join(','))
@@ -380,6 +383,9 @@ io.on('connection', (socket) => {
         }
     });
 });
+
+// 独立命名空间，不修改现有房间、鉴权和事件语义。
+attachArrowArena({ app, io, authKey: AUTH_KEY });
 
 const peerServer = ExpressPeerServer(server, {
     debug: false, 

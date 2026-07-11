@@ -418,7 +418,9 @@ function attachArrowArena({ app, io, authKey }) {
                 existingRoom.emptyAt = 0;
                 socket.data.arenaRoom = existingRoom.code;
                 socket.join(existingRoom.code);
-                return acknowledge({ ok: true, roomCode: existingRoom.code, playerId: existingPlayer.id, maxPlayers, reconnected: true });
+                const peers = Array.from(existingRoom.players.values()).filter(other => other.id !== existingPlayer.id && !other.offlineAt).map(other => other.id);
+                socket.to(existingRoom.code).emit('arena_peer_joined', { playerId: existingPlayer.id });
+                return acknowledge({ ok: true, roomCode: existingRoom.code, playerId: existingPlayer.id, maxPlayers, peers, reconnected: true });
             }
             let code = cleanRoomCode(data.roomCode);
             let room = code ? rooms.get(code) : null;
@@ -440,7 +442,32 @@ function attachArrowArena({ app, io, authKey }) {
             room.emptyAt = 0;
             socket.data.arenaRoom = room.code;
             socket.join(room.code);
-            acknowledge({ ok: true, roomCode: room.code, playerId: player.id, maxPlayers });
+            const peers = Array.from(room.players.values()).filter(other => other.id !== player.id && !other.offlineAt).map(other => other.id);
+            socket.to(room.code).emit('arena_peer_joined', { playerId: player.id });
+            acknowledge({ ok: true, roomCode: room.code, playerId: player.id, maxPlayers, peers });
+        });
+
+        // Socket.IO only carries WebRTC signalling. Gameplay remains server-authoritative,
+        // while connected peers can exchange high-frequency visual state directly.
+        socket.on('arena_rtc_signal', (data) => {
+            const code = socket.data.arenaRoom;
+            const room = rooms.get(code);
+            const targetId = String(data?.targetId || '');
+            const target = room?.players.get(targetId);
+            if (!room || !target || target.offlineAt || !target.socketId || targetId === identityId) return;
+            const description = data?.description;
+            const candidate = data?.candidate;
+            if (!description && !candidate) return;
+            const targetSocket = arena.sockets.get(target.socketId);
+            targetSocket?.emit('arena_rtc_signal', {
+                fromId: identityId,
+                description: description && typeof description.type === 'string' && typeof description.sdp === 'string'
+                    ? { type: description.type, sdp: description.sdp.slice(0, 200000) }
+                    : undefined,
+                candidate: candidate && typeof candidate.candidate === 'string'
+                    ? { candidate: candidate.candidate.slice(0, 8192), sdpMid: candidate.sdpMid ?? null, sdpMLineIndex: candidate.sdpMLineIndex ?? null }
+                    : undefined
+            });
         });
 
         socket.on('arena_input', (data) => {
@@ -481,6 +508,8 @@ function attachArrowArena({ app, io, authKey }) {
         });
 
         socket.on('disconnect', () => {
+            const code = socket.data.arenaRoom;
+            if (code) socket.to(code).emit('arena_peer_left', { playerId: identityId });
             markPlayerOffline(socket);
             if (activeIdentities.get(identityId) === socket.id) activeIdentities.delete(identityId);
             if (activeBrowsers.get(browserKey) === socket.id) {

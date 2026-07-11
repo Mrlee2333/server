@@ -4,8 +4,8 @@ const crypto = require('crypto');
 
 const WORLD_W = 2600;
 const WORLD_H = 1800;
-const TICK_MS = 50;
-const SNAPSHOT_MS = 1000 / 15;
+const TICK_MS = 1000 / 30;
+const SNAPSHOT_MS = 1000 / 20;
 const OFFLINE_GRACE_MS = 3 * 60 * 1000;
 const EMPTY_ROOM_TTL_MS = 10_000;
 const DASH_COOLDOWN_MS = 1800;
@@ -63,11 +63,19 @@ function pointSegmentDistanceSq(px, py, x1, y1, x2, y2) {
 }
 
 function randomPlayerName() {
-    const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-    const digits = '23456789';
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let suffix = '';
-    for (let i = 0; i < 3; i++) suffix += letters[crypto.randomInt(letters.length)] + digits[crypto.randomInt(digits.length)];
-    return `PX${suffix}`;
+    for (let i = 0; i < 8; i++) suffix += alphabet[crypto.randomInt(alphabet.length)];
+    return `PLAY-${suffix}`;
+}
+
+function uniquePlayerName(identities) {
+    const used = new Set(Array.from(identities.values(), identity => identity.playerName));
+    for (let attempt = 0; attempt < 20; attempt++) {
+        const name = randomPlayerName();
+        if (!used.has(name)) return name;
+    }
+    return `PLAY-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
 }
 
 function cleanRoomCode(value) {
@@ -159,6 +167,7 @@ function createPlayer(identity, socket, room) {
     const spawn = chooseSpawn(room);
     return {
         id: identity.id,
+        browserKey: identity.browserKey,
         socketId: socket.id,
         name: identity.name,
         x: spawn.x,
@@ -362,8 +371,8 @@ function attachArrowArena({ app, io, authKey }) {
         rooms: rooms.size,
         players: Array.from(rooms.values()).reduce((sum, room) => sum + room.players.size, 0),
         onlinePlayers: Array.from(rooms.values()).reduce((sum, room) => sum + Array.from(room.players.values()).filter(player => !player.offlineAt).length, 0),
-        tickRate: 1000 / TICK_MS,
-        snapshotRate: 15,
+        tickRate: Math.round(1000 / TICK_MS),
+        snapshotRate: Math.round(1000 / SNAPSHOT_MS),
         maxRooms,
         maxPlayersPerRoom: maxPlayers,
         offlineGraceSeconds: OFFLINE_GRACE_MS / 1000,
@@ -381,9 +390,10 @@ function attachArrowArena({ app, io, authKey }) {
         if (!browserId) return res.status(400).json({ error: '浏览器身份无效' });
         const ipKey = fingerprint(ip, secret);
         const browserKey = fingerprint(`${ipKey}:${browserId}`, secret);
+        const activeSocketId = activeBrowsers.get(browserKey);
+        if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return res.status(409).json({ error: '此浏览器已有游戏窗口在线，请关闭后再试' });
         let cached = browserIdentities.get(browserKey);
-        if (!cached || now - cached.lastSeen > 30 * 60_000) cached = { playerId: crypto.randomUUID(), playerName: randomPlayerName(), lastSeen: now };
-        if (!cached.playerName) cached.playerName = randomPlayerName();
+        if (!cached) cached = { playerId: crypto.randomBytes(18).toString('base64url'), playerName: uniquePlayerName(browserIdentities), lastSeen: now };
         cached.lastSeen = now;
         browserIdentities.set(browserKey, cached);
         const identity = { id: cached.playerId, name: cached.playerName, ipKey, browserKey, exp: now + 30 * 60_000 };
@@ -394,10 +404,10 @@ function attachArrowArena({ app, io, authKey }) {
         const identity = verifyTicket(socket.handshake.auth?.ticket, secret);
         if (!identity) return next(new Error('Invalid or expired game ticket'));
         if (identity.ipKey !== fingerprint(socketIp(socket), secret)) return next(new Error('Game ticket IP mismatch'));
-        const replacing = activeBrowsers.has(identity.browserKey);
-        if (!replacing && (activeIpCounts.get(identity.ipKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
+        const activeSocketId = activeBrowsers.get(identity.browserKey);
+        if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return next(new Error('This browser already has an active game window'));
+        if ((activeIpCounts.get(identity.ipKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
         socket.data.arenaIdentity = identity;
-        socket.data.replacingBrowser = replacing;
         next();
     });
 
@@ -435,10 +445,7 @@ function attachArrowArena({ app, io, authKey }) {
         const browserKey = socket.data.arenaIdentity.browserKey;
         const ipKey = socket.data.arenaIdentity.ipKey;
         const previousBrowserSocketId = activeBrowsers.get(browserKey);
-        const replacingBrowser = previousBrowserSocketId && previousBrowserSocketId !== socket.id;
-        if (!replacingBrowser) {
-            activeIpCounts.set(ipKey, (activeIpCounts.get(ipKey) || 0) + 1);
-        }
+        activeIpCounts.set(ipKey, (activeIpCounts.get(ipKey) || 0) + 1);
         activeBrowsers.set(browserKey, socket.id);
         const previousSocket = activeIdentities.get(identityId);
         activeIdentities.set(identityId, socket.id);
@@ -596,7 +603,7 @@ function attachArrowArena({ app, io, authKey }) {
         }
         if (sessionRates.size > 2048) sessionRates.clear();
         if (browserIdentities.size > 4096) {
-            for (const [key, identity] of browserIdentities) if (now - identity.lastSeen > 30 * 60_000) browserIdentities.delete(key);
+            for (const [key, identity] of browserIdentities) if (now - identity.lastSeen > 24 * 60 * 60_000) browserIdentities.delete(key);
             if (browserIdentities.size > 4096) browserIdentities.clear();
         }
     }, TICK_MS);

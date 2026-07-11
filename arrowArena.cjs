@@ -139,6 +139,7 @@ function createRoom(code) {
         players: new Map(),
         projectiles: [],
         nextProjectileId: 1,
+        nextCombatEventId: 1,
         createdAt: Date.now(),
         emptyAt: 0,
         snapshotAt: 0
@@ -201,12 +202,28 @@ function deactivateProjectile(projectile) {
     projectile.hitIds.clear();
 }
 
-function damagePlayer(room, target, owner, damage, now) {
-    if (!target.alive || now < target.invulnerableUntil) return;
+function damagePlayer(room, target, owner, damage, now, weapon) {
+    if (!target.alive || target.offlineAt || now < target.invulnerableUntil) return false;
+    const previousHp = target.hp;
     target.hp = Math.max(0, target.hp - damage);
-    if (owner && owner !== target && owner.lifesteal > 0) owner.hp = Math.min(owner.maxHp, owner.hp + damage * owner.lifesteal);
+    const appliedDamage = previousHp - target.hp;
+    if (appliedDamage <= 0) return false;
+    if (owner && owner !== target && owner.lifesteal > 0) owner.hp = Math.min(owner.maxHp, owner.hp + appliedDamage * owner.lifesteal);
     target.invulnerableUntil = now + HIT_PROTECTION_MS;
-    if (target.hp > 0) return;
+    const killed = target.hp <= 0;
+    room.arena?.to(room.code).emit('arena_hit', {
+        id: room.nextCombatEventId++,
+        targetId: target.id,
+        attackerId: owner?.id || '',
+        damage: Math.round(appliedDamage),
+        hp: Math.round(target.hp),
+        killed,
+        weapon: weapon || owner?.weapon || 'bow',
+        x: Math.round(target.x),
+        y: Math.round(target.y),
+        time: now
+    });
+    if (!killed) return true;
     target.alive = false;
     target.state = 'dead';
     target.vx = target.vy = 0;
@@ -223,6 +240,7 @@ function damagePlayer(room, target, owner, damage, now) {
         owner.hp = Math.min(owner.maxHp, owner.hp + 24);
         owner.energy = Math.min(100, owner.energy + 22);
     }
+    return true;
 }
 
 function useWeapon(room, player, now) {
@@ -237,12 +255,12 @@ function useWeapon(room, player, now) {
         const swordRange = weapon.range * (1 + (player.multishot - 1) * 0.08);
         const rangeSq = swordRange * swordRange;
         for (const target of room.players.values()) {
-            if (target === player || !target.alive) continue;
+            if (target === player || !target.alive || target.offlineAt) continue;
             const dx = target.x - player.x;
             const dy = target.y - player.y;
             const distanceSq = dx * dx + dy * dy;
             if (distanceSq > 1 && distanceSq <= rangeSq && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
-                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now);
+                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now, player.weapon);
             }
         }
         return;
@@ -331,10 +349,10 @@ function simulateRoom(room, now, dt) {
         if (projectile.x < 0 || projectile.y < 0 || projectile.x > WORLD_W || projectile.y > WORLD_H) { deactivateProjectile(projectile); continue; }
         const owner = room.players.get(projectile.ownerId);
         for (const target of room.players.values()) {
-            if (!target.alive || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
+            if (!target.alive || target.offlineAt || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
             if (pointSegmentDistanceSq(target.x, target.y, previousX, previousY, projectile.x, projectile.y) > projectile.hitRadius * projectile.hitRadius) continue;
             projectile.hitIds.add(target.id);
-            damagePlayer(room, target, owner, projectile.damage, now);
+            damagePlayer(room, target, owner, projectile.damage, now, projectile.weapon);
             if (projectile.pierce-- <= 0) { deactivateProjectile(projectile); break; }
         }
     }
@@ -403,25 +421,27 @@ function attachArrowArena({ app, io, authKey }) {
         const browserId = cleanBrowserId(req.body?.browserId);
         if (!browserId) return res.status(400).json({ error: '浏览器身份无效' });
         const ipKey = fingerprint(ip, secret);
-        const browserKey = fingerprint(`${ipKey}:${browserId}`, secret);
+        // 浏览器身份不能绑定 IP：移动网络切换、双栈出口变化和代理漂移都会让
+        // Socket.IO 重连被误判成新设备，表现为游戏无故掉线。
+        const browserKey = fingerprint(browserId, secret);
         const activeSocketId = activeBrowsers.get(browserKey);
         if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return res.status(409).json({ error: '此浏览器已有游戏窗口在线，请关闭后再试' });
         let cached = browserIdentities.get(browserKey);
         if (!cached) cached = { playerId: crypto.randomBytes(18).toString('base64url'), playerName: uniquePlayerName(browserIdentities), lastSeen: now };
         cached.lastSeen = now;
         browserIdentities.set(browserKey, cached);
-        const identity = { id: cached.playerId, name: cached.playerName, ipKey, browserKey, exp: now + 30 * 60_000 };
+        const identity = { id: cached.playerId, name: cached.playerName, ipKey, browserKey, exp: now + 24 * 60 * 60_000 };
         res.json({ token: signTicket(identity, secret), playerId: identity.id, name: identity.name, namespace: '/arrow-arena' });
     });
 
     arena.use((socket, next) => {
         const identity = verifyTicket(socket.handshake.auth?.ticket, secret);
         if (!identity) return next(new Error('Invalid or expired game ticket'));
-        if (identity.ipKey !== fingerprint(socketIp(socket), secret)) return next(new Error('Game ticket IP mismatch'));
+        const currentIpKey = fingerprint(socketIp(socket), secret);
         const activeSocketId = activeBrowsers.get(identity.browserKey);
         if (activeSocketId && arena.sockets.get(activeSocketId)?.connected) return next(new Error('This browser already has an active game window'));
-        if ((activeIpCounts.get(identity.ipKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
-        socket.data.arenaIdentity = identity;
+        if ((activeIpCounts.get(currentIpKey) || 0) >= maxPlayersPerIp) return next(new Error('Too many active game clients from this IP'));
+        socket.data.arenaIdentity = { ...identity, ipKey: currentIpKey };
         next();
     });
 
@@ -519,9 +539,16 @@ function attachArrowArena({ app, io, authKey }) {
             const player = room?.players.get(socket.data.arenaIdentity.id);
             if (!player || !data || typeof data !== 'object') return;
             const now = Date.now();
-            if (now - player.inputWindowAt >= 1000) { player.inputWindowAt = now; player.inputCount = 0; }
+            if (now - player.inputWindowAt >= 1000) {
+                player.inputWindowAt = now;
+                player.inputCount = 0;
+                // 正常的一秒会恢复一次信用，避免偶发卡顿/补包永久累计到踢线。
+                player.strikes = Math.max(0, player.strikes - 1);
+            }
             if (++player.inputCount > 40) {
-                if (++player.strikes >= 3) socket.disconnect(true);
+                // 丢弃突发输入即可。Socket.IO 重连或页面恢复时可能瞬间补发，
+                // 服务端不应因为这种可恢复抖动主动断开连接。
+                player.strikes = Math.min(3, player.strikes + 1);
                 return;
             }
             const sequence = Math.trunc(finiteNumber(data.sequence, -1));
@@ -568,9 +595,11 @@ function attachArrowArena({ app, io, authKey }) {
             if (activeIdentities.get(identityId) === socket.id) activeIdentities.delete(identityId);
             if (activeBrowsers.get(browserKey) === socket.id) {
                 activeBrowsers.delete(browserKey);
-                const remaining = Math.max(0, (activeIpCounts.get(ipKey) || 1) - 1);
-                if (remaining) activeIpCounts.set(ipKey, remaining); else activeIpCounts.delete(ipKey);
             }
+            // 每个成功通过中间件的 socket 都增加过一次计数。旧 socket 被重连
+            // 替换时 activeBrowsers 已指向新 socket，也必须在这里独立减回去。
+            const remaining = Math.max(0, (activeIpCounts.get(ipKey) || 1) - 1);
+            if (remaining) activeIpCounts.set(ipKey, remaining); else activeIpCounts.delete(ipKey);
         });
     });
 

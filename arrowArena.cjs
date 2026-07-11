@@ -143,6 +143,7 @@ function createPlayer(identity, socket, room) {
         vx: 0, vy: 0, aimX: 1, aimY: 0,
         dashX: 1, dashY: 0,
         hp: 125, maxHp: 125, energy: 100,
+        level: 1, speed: 235, damageScale: 1,
         weapon: 'bow', state: 'idle', alive: true,
         kills: 0, deaths: 0,
         lastInputSeq: 0, lastShot: 0, lastDash: 0,
@@ -176,8 +177,20 @@ function damagePlayer(room, target, owner, damage, now) {
     target.state = 'dead';
     target.vx = target.vy = 0;
     target.deaths++;
-    target.respawnAt = now + 3000;
-    if (owner && owner !== target) owner.kills++;
+    target.respawnAt = now + 1500;
+    if (owner && owner !== target) {
+        owner.kills++;
+        const nextLevel = Math.min(20, owner.kills + 1);
+        if (nextLevel > owner.level) {
+            owner.level = nextLevel;
+            owner.damageScale = 1 + (owner.level - 1) * 0.045;
+            owner.speed = 235 + (owner.level - 1) * 2.5;
+            owner.maxHp = 125 + (owner.level - 1) * 5;
+        }
+        // 击杀奖励让战斗保持连续，不必脱离交战等待恢复。
+        owner.hp = Math.min(owner.maxHp, owner.hp + 24);
+        owner.energy = Math.min(100, owner.energy + 22);
+    }
 }
 
 function useWeapon(room, player, now) {
@@ -196,7 +209,7 @@ function useWeapon(room, player, now) {
             const dy = target.y - player.y;
             const distanceSq = dx * dx + dy * dy;
             if (distanceSq > 1 && distanceSq <= rangeSq && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
-                damagePlayer(room, target, player, weapon.damage, now);
+                damagePlayer(room, target, player, weapon.damage * player.damageScale, now);
             }
         }
         return;
@@ -211,7 +224,7 @@ function useWeapon(room, player, now) {
     projectile.y = player.y + player.aimY * 30;
     projectile.vx = player.aimX * weapon.speed;
     projectile.vy = player.aimY * weapon.speed;
-    projectile.damage = weapon.damage;
+    projectile.damage = weapon.damage * player.damageScale;
     projectile.expiresAt = now + weapon.life;
     projectile.weapon = player.weapon;
     projectile.pierce = weapon.pierce;
@@ -258,8 +271,8 @@ function simulateRoom(room, now, dt) {
             player.vy = player.dashY * 760;
             player.state = 'move';
         } else {
-            player.vx = input.moveX * 235;
-            player.vy = input.moveY * 235;
+            player.vx = input.moveX * player.speed;
+            player.vy = input.moveY * player.speed;
             player.state = Math.abs(input.moveX) + Math.abs(input.moveY) > 0.02 ? 'move' : 'idle';
         }
 
@@ -293,7 +306,7 @@ function makeSnapshot(room, now) {
     const projectiles = [];
     for (const player of room.players.values()) {
         if (player.offlineAt) continue;
-        players.push([player.id, player.name, Math.round(player.x), Math.round(player.y), Math.round(player.vx), Math.round(player.vy), +player.aimX.toFixed(3), +player.aimY.toFixed(3), Math.round(player.hp), player.maxHp, Math.round(player.energy), player.weapon, player.state, player.kills, player.deaths, player.lastInputSeq]);
+        players.push([player.id, player.name, Math.round(player.x), Math.round(player.y), Math.round(player.vx), Math.round(player.vy), +player.aimX.toFixed(3), +player.aimY.toFixed(3), Math.round(player.hp), player.maxHp, Math.round(player.energy), player.weapon, player.state, player.kills, player.deaths, player.lastInputSeq, player.level, +player.speed.toFixed(1)]);
     }
     for (const projectile of room.projectiles) {
         if (projectile.active) projectiles.push([projectile.id, Math.round(projectile.x), Math.round(projectile.y), Math.round(projectile.vx), Math.round(projectile.vy), projectile.weapon, projectile.ownerId]);

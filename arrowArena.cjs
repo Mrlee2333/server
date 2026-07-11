@@ -653,6 +653,11 @@ function attachArrowArena({ app, io, authKey }) {
                 existingPlayer.offlineAt = 0;
                 existingPlayer.name = socket.data.arenaIdentity.name;
                 existingPlayer.state = existingPlayer.alive ? 'idle' : 'dead';
+                existingPlayer.lastInputSeq = 0;
+                existingPlayer.inputWindowAt = Date.now();
+                existingPlayer.inputCount = 0;
+                existingPlayer.strikes = 0;
+                existingPlayer._delta.clear();
                 existingRoom.emptyAt = 0;
                 socket.data.arenaRoom = existingRoom.code;
                 socket.join(existingRoom.code);

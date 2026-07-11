@@ -19,6 +19,29 @@ const WEAPONS = Object.freeze({
     pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 24 },
     pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 32 }
 });
+const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multishot', 'pierce', 'lifesteal', 'dash']);
+
+function offerUpgrade(room, player) {
+    if (player.pendingUpgrades?.length || !player.socketId) return;
+    const pool = [...UPGRADE_IDS];
+    for (let i = pool.length - 1; i > 0; i--) {
+        const j = crypto.randomInt(i + 1);
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    player.pendingUpgrades = pool.slice(0, 3);
+    room.arena?.to(player.socketId).emit('arena_upgrade_choices', { choices: player.pendingUpgrades, level: player.level });
+}
+
+function applyUpgrade(player, id) {
+    if (id === 'damage') player.damageScale = Math.min(2.4, player.damageScale * 1.18);
+    else if (id === 'speed') player.speed = Math.min(340, player.speed * 1.1);
+    else if (id === 'health') { player.maxHp = Math.min(350, player.maxHp + 30); player.hp = Math.min(player.maxHp, player.hp + 40); }
+    else if (id === 'rapid') player.cooldownScale = Math.max(0.52, player.cooldownScale * 0.86);
+    else if (id === 'multishot') player.multishot = Math.min(4, player.multishot + 1);
+    else if (id === 'pierce') player.pierceBonus = Math.min(4, player.pierceBonus + 1);
+    else if (id === 'lifesteal') player.lifesteal = Math.min(0.25, player.lifesteal + 0.05);
+    else if (id === 'dash') player.dashCooldown = Math.max(850, player.dashCooldown * 0.82);
+}
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
@@ -143,7 +166,8 @@ function createPlayer(identity, socket, room) {
         vx: 0, vy: 0, aimX: 1, aimY: 0,
         dashX: 1, dashY: 0,
         hp: 125, maxHp: 125, energy: 100,
-        level: 1, speed: 235, damageScale: 1,
+        level: 1, speed: 235, damageScale: 1, cooldownScale: 1,
+        multishot: 1, pierceBonus: 0, lifesteal: 0, dashCooldown: DASH_COOLDOWN_MS, pendingUpgrades: [],
         weapon: 'bow', state: 'idle', alive: true,
         kills: 0, deaths: 0,
         lastInputSeq: 0, lastShot: 0, lastDash: 0,
@@ -171,6 +195,7 @@ function deactivateProjectile(projectile) {
 function damagePlayer(room, target, owner, damage, now) {
     if (!target.alive || now < target.invulnerableUntil) return;
     target.hp = Math.max(0, target.hp - damage);
+    if (owner && owner !== target && owner.lifesteal > 0) owner.hp = Math.min(owner.maxHp, owner.hp + damage * owner.lifesteal);
     target.invulnerableUntil = now + HIT_PROTECTION_MS;
     if (target.hp > 0) return;
     target.alive = false;
@@ -180,12 +205,10 @@ function damagePlayer(room, target, owner, damage, now) {
     target.respawnAt = now + 1500;
     if (owner && owner !== target) {
         owner.kills++;
-        const nextLevel = Math.min(20, owner.kills + 1);
+        const nextLevel = Math.min(30, owner.kills + 1);
         if (nextLevel > owner.level) {
             owner.level = nextLevel;
-            owner.damageScale = 1 + (owner.level - 1) * 0.045;
-            owner.speed = 235 + (owner.level - 1) * 2.5;
-            owner.maxHp = 125 + (owner.level - 1) * 5;
+            offerUpgrade(room, owner);
         }
         // 击杀奖励让战斗保持连续，不必脱离交战等待恢复。
         owner.hp = Math.min(owner.maxHp, owner.hp + 24);
@@ -195,41 +218,48 @@ function damagePlayer(room, target, owner, damage, now) {
 
 function useWeapon(room, player, now) {
     const weapon = WEAPONS[player.weapon] || WEAPONS.bow;
-    if (now - player.lastShot < weapon.cooldown) return;
+    if (now - player.lastShot < weapon.cooldown * player.cooldownScale) return;
     if (weapon.energy && player.energy < weapon.energy) return;
     player.lastShot = now;
     player.state = 'attack';
     if (weapon.energy) player.energy -= weapon.energy;
 
     if (player.weapon === 'sword') {
-        const rangeSq = weapon.range * weapon.range;
+        const swordRange = weapon.range * (1 + (player.multishot - 1) * 0.08);
+        const rangeSq = swordRange * swordRange;
         for (const target of room.players.values()) {
             if (target === player || !target.alive) continue;
             const dx = target.x - player.x;
             const dy = target.y - player.y;
             const distanceSq = dx * dx + dy * dy;
             if (distanceSq > 1 && distanceSq <= rangeSq && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
-                damagePlayer(room, target, player, weapon.damage * player.damageScale, now);
+                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now);
             }
         }
         return;
     }
 
-    const projectile = getProjectile(room);
-    if (!projectile) return;
-    projectile.active = true;
-    projectile.id = room.nextProjectileId++;
-    projectile.ownerId = player.id;
-    projectile.x = player.x + player.aimX * 30;
-    projectile.y = player.y + player.aimY * 30;
-    projectile.vx = player.aimX * weapon.speed;
-    projectile.vy = player.aimY * weapon.speed;
-    projectile.damage = weapon.damage * player.damageScale;
-    projectile.expiresAt = now + weapon.life;
-    projectile.weapon = player.weapon;
-    projectile.pierce = weapon.pierce;
-    projectile.hitRadius = weapon.hitRadius;
-    projectile.hitIds.clear();
+    const count = player.weapon === 'pulse' ? 1 : player.multishot;
+    for (let i = 0; i < count; i++) {
+        const projectile = getProjectile(room);
+        if (!projectile) break;
+        const spread = count === 1 ? 0 : (i - (count - 1) / 2) * (player.weapon === 'pistol' ? 0.075 : 0.11);
+        const baseAngle = Math.atan2(player.aimY, player.aimX) + spread;
+        const dx = Math.cos(baseAngle), dy = Math.sin(baseAngle);
+        projectile.active = true;
+        projectile.id = room.nextProjectileId++;
+        projectile.ownerId = player.id;
+        projectile.x = player.x + dx * 30;
+        projectile.y = player.y + dy * 30;
+        projectile.vx = dx * weapon.speed;
+        projectile.vy = dy * weapon.speed;
+        projectile.damage = weapon.damage * player.damageScale;
+        projectile.expiresAt = now + weapon.life;
+        projectile.weapon = player.weapon;
+        projectile.pierce = weapon.pierce + player.pierceBonus;
+        projectile.hitRadius = weapon.hitRadius;
+        projectile.hitIds.clear();
+    }
 }
 
 function respawnPlayer(room, player, now) {
@@ -256,7 +286,7 @@ function simulateRoom(room, now, dt) {
         const input = player.input;
         if (input.dash) {
             input.dash = false;
-            if (now - player.lastDash >= DASH_COOLDOWN_MS && player.energy >= DASH_ENERGY) {
+            if (now - player.lastDash >= player.dashCooldown && player.energy >= DASH_ENERGY) {
                 player.lastDash = now;
                 player.dashUntil = now + 190;
                 player.energy -= DASH_ENERGY;
@@ -306,7 +336,7 @@ function makeSnapshot(room, now) {
     const projectiles = [];
     for (const player of room.players.values()) {
         if (player.offlineAt) continue;
-        players.push([player.id, player.name, Math.round(player.x), Math.round(player.y), Math.round(player.vx), Math.round(player.vy), +player.aimX.toFixed(3), +player.aimY.toFixed(3), Math.round(player.hp), player.maxHp, Math.round(player.energy), player.weapon, player.state, player.kills, player.deaths, player.lastInputSeq, player.level, +player.speed.toFixed(1)]);
+        players.push([player.id, player.name, Math.round(player.x), Math.round(player.y), Math.round(player.vx), Math.round(player.vy), +player.aimX.toFixed(3), +player.aimY.toFixed(3), Math.round(player.hp), player.maxHp, Math.round(player.energy), player.weapon, player.state, player.kills, player.deaths, player.lastInputSeq, player.level, +player.speed.toFixed(1), +player.cooldownScale.toFixed(3), player.multishot, player.pierceBonus]);
     }
     for (const projectile of room.projectiles) {
         if (projectile.active) projectiles.push([projectile.id, Math.round(projectile.x), Math.round(projectile.y), Math.round(projectile.vx), Math.round(projectile.vy), projectile.weapon, projectile.ownerId]);
@@ -433,6 +463,7 @@ function attachArrowArena({ app, io, authKey }) {
                 socket.join(existingRoom.code);
                 const peers = Array.from(existingRoom.players.values()).filter(other => other.id !== existingPlayer.id && !other.offlineAt).map(other => other.id);
                 socket.to(existingRoom.code).emit('arena_peer_joined', { playerId: existingPlayer.id });
+                if (existingPlayer.pendingUpgrades?.length) setTimeout(() => existingRoom.arena?.to(existingPlayer.socketId).emit('arena_upgrade_choices', { choices: existingPlayer.pendingUpgrades, level: existingPlayer.level }), 250);
                 return acknowledge({ ok: true, roomCode: existingRoom.code, playerId: existingPlayer.id, maxPlayers, peers, reconnected: true });
             }
             let code = cleanRoomCode(data.roomCode);
@@ -447,6 +478,7 @@ function attachArrowArena({ app, io, authKey }) {
                 code = code || randomCode(rooms);
                 if (!code) return acknowledge({ ok: false, error: '无法创建房间' });
                 room = createRoom(code);
+                room.arena = arena;
                 rooms.set(code, room);
             }
             if (room.players.size >= maxPlayers) return acknowledge({ ok: false, error: '房间人数已满' });
@@ -511,6 +543,15 @@ function attachArrowArena({ app, io, authKey }) {
             player.input.shooting = data.shooting === true;
             player.input.dash = player.input.dash || data.dash === true;
             if (Object.hasOwn(WEAPONS, data.weapon)) player.weapon = data.weapon;
+        });
+
+        socket.on('arena_upgrade_select', (data) => {
+            const room = rooms.get(socket.data.arenaRoom);
+            const player = room?.players.get(socket.data.arenaIdentity.id);
+            const id = String(data?.id || '');
+            if (!player?.pendingUpgrades?.includes(id)) return;
+            applyUpgrade(player, id);
+            player.pendingUpgrades = [];
         });
 
         socket.on('arena_ping', (_data, acknowledge) => {

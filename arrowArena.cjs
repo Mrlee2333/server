@@ -4,7 +4,7 @@ const crypto = require('crypto');
 
 const WORLD_W = 2600;
 const WORLD_H = 1800;
-const TICK_MS = 1000 / 30;
+const TICK_MS = 1000 / 60;
 const SNAPSHOT_MS = 1000 / 20;
 const OFFLINE_GRACE_MS = 3 * 60 * 1000;
 const MAX_TOTAL_PLAYERS = 160;
@@ -14,13 +14,13 @@ const DASH_ENERGY = 20;
 const ENERGY_REGEN_PER_SECOND = 5;
 const HIT_PROTECTION_MS = 110;
 const INPUT_STALE_MS = 250;
-const PLAYER_HIT_RADIUS = 24;
+const PLAYER_HIT_RADIUS = 20;
 
 const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
-    bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 38 },
-    pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 34 },
-    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 42 }
+    bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 14 },
+    pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 10 },
+    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 18 }
 });
 const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multishot', 'pierce', 'lifesteal', 'dash']);
 
@@ -301,7 +301,7 @@ function createPlayer(identity, socket, room) {
         lastInputSeq: 0, lastShot: 0, lastDash: 0,
         dashUntil: 0, invulnerableUntil: Date.now() + 1000, respawnAt: 0,
         offlineAt: 0,
-        inputWindowAt: Date.now(), inputCount: 0, strikes: 0, lastInputAt: Date.now(),
+        inputWindowAt: Date.now(), inputCount: 0, strikes: 0, lastInputAt: Date.now(), inputLatencyMs: 50,
         input: { moveX: 0, moveY: 0, aimX: 1, aimY: 0, shooting: false, dash: false },
         _delta: new Map()
     };
@@ -321,7 +321,15 @@ function deactivateProjectile(projectile) {
     projectile.hitIds.clear();
 }
 
-function damagePlayer(room, target, owner, damage, now, weapon) {
+function combatPosition(player) {
+    const leadSeconds = clamp(player.inputLatencyMs, 0, 160) / 1000;
+    return {
+        x: clamp(player.x + player.vx * leadSeconds, 35, WORLD_W - 35),
+        y: clamp(player.y + player.vy * leadSeconds, 35, WORLD_H - 35)
+    };
+}
+
+function damagePlayer(room, target, owner, damage, now, weapon, impactX = target.x, impactY = target.y) {
     if (!target.alive || target.offlineAt || now < target.invulnerableUntil) return false;
     const previousHp = target.hp;
     target.hp = Math.max(0, target.hp - damage);
@@ -340,8 +348,12 @@ function damagePlayer(room, target, owner, damage, now, weapon) {
         weapon: weapon || owner?.weapon || 'bow',
         attackerX: owner ? Math.round(owner.x) : null,
         attackerY: owner ? Math.round(owner.y) : null,
-        x: Math.round(target.x),
-        y: Math.round(target.y),
+        attackerVx: owner ? Math.round(owner.vx) : 0,
+        attackerVy: owner ? Math.round(owner.vy) : 0,
+        x: Math.round(impactX),
+        y: Math.round(impactY),
+        targetVx: Math.round(target.vx),
+        targetVy: Math.round(target.vy),
         time: now
     });
     if (!killed) return true;
@@ -372,16 +384,29 @@ function useWeapon(room, player, now) {
     player.state = 'attack';
     if (weapon.energy) player.energy -= weapon.energy;
 
+    const attackId = room.nextCombatEventId++;
+    const attackLeadMs = clamp(player.inputLatencyMs, 0, 160);
+    const attackTime = now - attackLeadMs;
+    const attackProjectiles = [];
+    const spawnedProjectiles = [];
+
     if (player.weapon === 'sword') {
+        room.arena?.to(room.code).emit('arena_attack', {
+            id: attackId, attackerId: player.id, weapon: player.weapon,
+            x: Math.round(player.x), y: Math.round(player.y),
+            vx: Math.round(player.vx), vy: Math.round(player.vy),
+            aimX: player.aimX, aimY: player.aimY, time: attackTime, projectiles: []
+        });
         const swordRange = weapon.range * (1 + (player.multishot - 1) * 0.08);
         const rangeSq = swordRange * swordRange;
         for (const target of room.players.values()) {
             if (target === player || !target.alive || target.offlineAt) continue;
-            const dx = target.x - player.x;
-            const dy = target.y - player.y;
+            const combatTarget = combatPosition(target);
+            const dx = combatTarget.x - player.x;
+            const dy = combatTarget.y - player.y;
             const distanceSq = dx * dx + dy * dy;
             if (distanceSq > 1 && distanceSq <= (swordRange + PLAYER_HIT_RADIUS) ** 2 && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
-                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now, player.weapon);
+                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now, player.weapon, combatTarget.x, combatTarget.y);
             }
         }
         return;
@@ -402,11 +427,43 @@ function useWeapon(room, player, now) {
         projectile.vx = dx * weapon.speed;
         projectile.vy = dy * weapon.speed;
         projectile.damage = weapon.damage * player.damageScale;
-        projectile.expiresAt = now + weapon.life;
+        projectile.expiresAt = now + Math.max(120, weapon.life - attackLeadMs);
         projectile.weapon = player.weapon;
         projectile.pierce = weapon.pierce + player.pierceBonus;
         projectile.hitRadius = weapon.hitRadius;
         projectile.hitIds.clear();
+        attackProjectiles.push({
+            id: projectile.id & 0xFFFF, x: Math.round(projectile.x), y: Math.round(projectile.y),
+            vx: Math.round(projectile.vx), vy: Math.round(projectile.vy), weapon: projectile.weapon
+        });
+        spawnedProjectiles.push(projectile);
+    }
+    room.arena?.to(room.code).emit('arena_attack', {
+        id: attackId, attackerId: player.id, weapon: player.weapon,
+        x: Math.round(player.x), y: Math.round(player.y),
+        vx: Math.round(player.vx), vy: Math.round(player.vy),
+        aimX: player.aimX, aimY: player.aimY, time: attackTime, projectiles: attackProjectiles
+    });
+    const leadSeconds = attackLeadMs / 1000;
+    if (leadSeconds > 0) for (const projectile of spawnedProjectiles) advanceProjectile(room, projectile, leadSeconds, now);
+}
+
+function advanceProjectile(room, projectile, dt, now) {
+    if (!projectile.active) return;
+    const previousX = projectile.x;
+    const previousY = projectile.y;
+    projectile.x += projectile.vx * dt;
+    projectile.y += projectile.vy * dt;
+    if (projectile.x < 0 || projectile.y < 0 || projectile.x > WORLD_W || projectile.y > WORLD_H) { deactivateProjectile(projectile); return; }
+    const owner = room.players.get(projectile.ownerId);
+    for (const target of room.players.values()) {
+        if (!target.alive || target.offlineAt || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
+        const combatTarget = combatPosition(target);
+        const hitRadius = projectile.hitRadius + PLAYER_HIT_RADIUS;
+        if (pointSegmentDistanceSq(combatTarget.x, combatTarget.y, previousX, previousY, projectile.x, projectile.y) > hitRadius * hitRadius) continue;
+        projectile.hitIds.add(target.id);
+        damagePlayer(room, target, owner, projectile.damage, now, projectile.weapon, combatTarget.x, combatTarget.y);
+        if (projectile.pierce-- <= 0) { deactivateProjectile(projectile); break; }
     }
 }
 
@@ -469,20 +526,7 @@ function simulateRoom(room, now, dt) {
     for (const projectile of room.projectiles) {
         if (!projectile.active) continue;
         if (now >= projectile.expiresAt) { deactivateProjectile(projectile); continue; }
-        const previousX = projectile.x;
-        const previousY = projectile.y;
-        projectile.x += projectile.vx * dt;
-        projectile.y += projectile.vy * dt;
-        if (projectile.x < 0 || projectile.y < 0 || projectile.x > WORLD_W || projectile.y > WORLD_H) { deactivateProjectile(projectile); continue; }
-        const owner = room.players.get(projectile.ownerId);
-        for (const target of room.players.values()) {
-            if (!target.alive || target.offlineAt || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
-            const hitRadius = projectile.hitRadius + PLAYER_HIT_RADIUS;
-            if (pointSegmentDistanceSq(target.x, target.y, previousX, previousY, projectile.x, projectile.y) > hitRadius * hitRadius) continue;
-            projectile.hitIds.add(target.id);
-            damagePlayer(room, target, owner, projectile.damage, now, projectile.weapon);
-            if (projectile.pierce-- <= 0) { deactivateProjectile(projectile); break; }
-        }
+        advanceProjectile(room, projectile, dt, now);
     }
 }
 
@@ -749,6 +793,9 @@ function attachArrowArena({ app, io, authKey }) {
             if (sequence <= player.lastInputSeq || sequence > player.lastInputSeq + 10_000) return;
             player.lastInputSeq = sequence;
             player.lastInputAt = now;
+            const clientTime = finiteNumber(data.clientTime, now);
+            const latencySample = clamp(now - clientTime, 0, 250);
+            player.inputLatencyMs += (latencySample - player.inputLatencyMs) * (latencySample <= player.inputLatencyMs + 30 ? 0.22 : 0.06);
             let moveX = clamp(finiteNumber(data.moveX), -1, 1);
             let moveY = clamp(finiteNumber(data.moveY), -1, 1);
             const moveLength = Math.hypot(moveX, moveY);

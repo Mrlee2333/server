@@ -524,6 +524,12 @@ function attachArrowArena({ app, io, authKey }) {
         return count;
     }
 
+    function getReservedPlayerCount() {
+        let count = 0;
+        for (const room of rooms.values()) count += room.players.size;
+        return count;
+    }
+
     function makeRoomState(room) {
         return { roomCode: room.code, playerCount: getOnlinePlayerCount(room), maxPlayers };
     }
@@ -680,8 +686,11 @@ function attachArrowArena({ app, io, authKey }) {
                 if (existingPlayer.pendingUpgrades?.length) setTimeout(() => existingRoom.arena?.to(existingPlayer.socketId).emit('arena_upgrade_choices', { choices: existingPlayer.pendingUpgrades, level: existingPlayer.level }), 250);
                 return acknowledge({ ok: true, roomCode: existingRoom.code, playerId: existingPlayer.id, ...roomState, reconnected: true });
             }
-            if (getTotalOnlineCount() >= MAX_TOTAL_PLAYERS) {
-                return acknowledge({ ok: false, error: '服务器已满（当前在线 ' + MAX_TOTAL_PLAYERS + ' 人），请稍后再试' });
+            // Offline players retain their slot during the reconnect grace period.
+            // Counting only live sockets would allow a disconnect wave to double
+            // the retained player state and memory footprint beyond the 160 cap.
+            if (getReservedPlayerCount() >= MAX_TOTAL_PLAYERS) {
+                return acknowledge({ ok: false, error: '服务器容量已满（含断线重连保留位，上限 ' + MAX_TOTAL_PLAYERS + ' 人），请稍后再试' });
             }
             let code = cleanRoomCode(data.roomCode);
             let room = code ? rooms.get(code) : null;
@@ -689,10 +698,10 @@ function attachArrowArena({ app, io, authKey }) {
                 let bestRoom = null;
                 let bestCount = -1;
                 for (const candidate of rooms.values()) {
-                    const online = getOnlinePlayerCount(candidate);
-                    if (online < maxPlayers && online > bestCount) {
+                    const occupied = candidate.players.size;
+                    if (occupied < maxPlayers && occupied > bestCount) {
                         bestRoom = candidate;
-                        bestCount = online;
+                        bestCount = occupied;
                     }
                 }
                 room = bestRoom;
@@ -705,7 +714,7 @@ function attachArrowArena({ app, io, authKey }) {
                 room.arena = arena;
                 rooms.set(code, room);
             }
-            if (getOnlinePlayerCount(room) >= maxPlayers) return acknowledge({ ok: false, error: '房间人数已满（' + maxPlayers + '/' + maxPlayers + '）' });
+            if (room.players.size >= maxPlayers) return acknowledge({ ok: false, error: '房间人数已满（' + maxPlayers + '/' + maxPlayers + '）' });
             const player = createPlayer(socket.data.arenaIdentity, socket, room);
             room.players.set(player.id, player);
             assignPlayerIndex(room, player.id);

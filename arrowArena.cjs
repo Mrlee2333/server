@@ -338,6 +338,8 @@ function damagePlayer(room, target, owner, damage, now, weapon) {
         hp: Math.round(target.hp),
         killed,
         weapon: weapon || owner?.weapon || 'bow',
+        attackerX: owner ? Math.round(owner.x) : null,
+        attackerY: owner ? Math.round(owner.y) : null,
         x: Math.round(target.x),
         y: Math.round(target.y),
         time: now

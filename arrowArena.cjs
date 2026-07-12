@@ -15,6 +15,9 @@ const ENERGY_REGEN_PER_SECOND = 5;
 const HIT_PROTECTION_MS = 110;
 const INPUT_STALE_MS = 250;
 const PLAYER_HIT_RADIUS = 20;
+const PARTY_MAX_SIZE = 4;
+const MATCH_LOADING_MS = 12_000;
+const PARTY_LOBBY_OFFLINE_MS = 30_000;
 
 const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
@@ -300,6 +303,7 @@ function createPlayer(identity, socket, room) {
         kills: 0, deaths: 0,
         lastInputSeq: 0, lastShot: 0, lastDash: 0,
         dashUntil: 0, invulnerableUntil: Date.now() + 1000, respawnAt: 0,
+        loadingUntil: 0,
         offlineAt: 0,
         inputWindowAt: Date.now(), inputCount: 0, strikes: 0, lastInputAt: Date.now(), inputLatencyMs: 50,
         input: { moveX: 0, moveY: 0, aimX: 1, aimY: 0, shooting: false, dash: false },
@@ -554,6 +558,8 @@ function attachArrowArena({ app, io, authKey }) {
     const activeBrowsers = new Map();
     const activeIpCounts = new Map();
     const browserIdentities = new Map();
+    const parties = new Map();
+    const playerParties = new Map();
     const arena = io.of('/arrow-arena');
 
     function getOnlinePlayerCount(room) {
@@ -572,6 +578,70 @@ function attachArrowArena({ app, io, authKey }) {
         let count = 0;
         for (const room of rooms.values()) count += room.players.size;
         return count;
+    }
+
+    function partyRoomName(code) { return `party:${code}`; }
+
+    function partyPayload(party) {
+        return {
+            code: party.code,
+            leaderId: party.leaderId,
+            state: party.state,
+            roomCode: party.roomCode || '',
+            maxSize: PARTY_MAX_SIZE,
+            members: Array.from(party.members.values(), member => ({
+                id: member.id,
+                name: member.name,
+                connected: !!member.socketId && !!arena.sockets.get(member.socketId)?.connected,
+                status: member.status
+            }))
+        };
+    }
+
+    function broadcastParty(party) {
+        arena.to(partyRoomName(party.code)).emit('party_state', partyPayload(party));
+    }
+
+    function attachPartySocket(party, member, socket) {
+        member.socketId = socket.id;
+        member.name = socket.data.arenaIdentity.name;
+        member.offlineAt = 0;
+        if (party.state === 'lobby') member.status = 'lobby';
+        socket.join(partyRoomName(party.code));
+        socket.data.partyCode = party.code;
+    }
+
+    function removePartyMember(party, playerId) {
+        const member = party.members.get(playerId);
+        if (!member) return;
+        const memberSocket = member.socketId ? arena.sockets.get(member.socketId) : null;
+        memberSocket?.leave(partyRoomName(party.code));
+        if (memberSocket) memberSocket.data.partyCode = '';
+        party.members.delete(playerId);
+        playerParties.delete(playerId);
+        if (party.leaderId === playerId) party.leaderId = party.members.keys().next().value || '';
+        if (party.members.size === 0) parties.delete(party.code);
+        else broadcastParty(party);
+    }
+
+    function selectRoomForParty(size) {
+        let bestRoom = null;
+        let bestOccupied = -1;
+        for (const candidate of rooms.values()) {
+            const occupied = candidate.players.size;
+            if (maxPlayers - occupied >= size && occupied > bestOccupied) {
+                bestRoom = candidate;
+                bestOccupied = occupied;
+            }
+        }
+        if (bestRoom) return bestRoom;
+        if (rooms.size >= maxRooms) return null;
+        const code = randomCode(rooms);
+        if (!code) return null;
+        const room = createRoom(code);
+        room.arena = arena;
+        rooms.set(code, room);
+        return room;
     }
 
     function makeRoomState(room) {
@@ -672,12 +742,32 @@ function attachArrowArena({ app, io, authKey }) {
         if (room) { broadcastRoomState(room); arena.to(code).emit('arena_player_map', getPlayerMapEntries(room)); }
     }
 
+    function placeSocketInRoom(socket, room, loading = false) {
+        leaveCurrentRoom(socket);
+        const player = createPlayer(socket.data.arenaIdentity, socket, room);
+        player.loadingUntil = loading ? Date.now() + MATCH_LOADING_MS : 0;
+        room.players.set(player.id, player);
+        assignPlayerIndex(room, player.id);
+        room.emptyAt = 0;
+        socket.data.arenaRoom = room.code;
+        socket.join(room.code);
+        arena.to(socket.id).emit('arena_player_map', getPlayerMapEntries(room));
+        arena.to(room.code).emit('arena_player_map', [{ index: room.playerIndexMap.get(player.id), id: player.id, name: player.name }]);
+        return player;
+    }
+
     function markPlayerOffline(socket) {
         const code = socket.data.arenaRoom;
         if (!code) return;
         const room = rooms.get(code);
         const player = room?.players.get(socket.data.arenaIdentity.id);
-        if (player && player.socketId === socket.id) {
+        if (player && player.socketId === socket.id && player.loadingUntil > Date.now()) {
+            releasePlayerIndex(room, player.id);
+            room.players.delete(player.id);
+            const party = parties.get(playerParties.get(player.id));
+            const member = party?.members.get(player.id);
+            if (member) { member.socketId = ''; member.status = 'offline'; member.offlineAt = Date.now(); broadcastParty(party); }
+        } else if (player && player.socketId === socket.id) {
             player.socketId = '';
             player.offlineAt = Date.now();
             player.vx = player.vy = 0;
@@ -687,6 +777,7 @@ function attachArrowArena({ app, io, authKey }) {
         }
         socket.leave(code);
         socket.data.arenaRoom = '';
+        if (room?.players.size === 0) room.emptyAt = Date.now();
     }
 
     arena.on('connection', (socket) => {
@@ -705,7 +796,122 @@ function attachArrowArena({ app, io, authKey }) {
             const oldSocket = arena.sockets.get(staleSocketId);
             if (oldSocket) oldSocket.disconnect(true);
         }
+        const existingParty = parties.get(playerParties.get(identityId));
+        if (existingParty) {
+            const member = existingParty.members.get(identityId);
+            if (member) {
+                attachPartySocket(existingParty, member, socket);
+                const gameRoom = existingParty.roomCode ? rooms.get(existingParty.roomCode) : null;
+                const existingPlayer = gameRoom?.players.get(identityId);
+                if (existingParty.state === 'in_game' && gameRoom && existingPlayer) {
+                    existingPlayer.socketId = socket.id;
+                    existingPlayer.offlineAt = 0;
+                    existingPlayer.loadingUntil = Date.now() + MATCH_LOADING_MS;
+                    socket.data.arenaRoom = gameRoom.code;
+                    socket.join(gameRoom.code);
+                    assignPlayerIndex(gameRoom, existingPlayer.id);
+                    arena.to(socket.id).emit('arena_player_map', getPlayerMapEntries(gameRoom));
+                    setTimeout(() => arena.to(socket.id).emit('party_match_found', { roomCode: gameRoom.code, party: partyPayload(existingParty) }), 0);
+                } else setTimeout(() => arena.to(socket.id).emit('party_state', partyPayload(existingParty)), 0);
+            }
+        }
+
+        socket.on('party_create', (_data = {}, acknowledge = () => {}) => {
+            if (socket.data.arenaRoom) return acknowledge({ ok: false, error: '战斗中无法创建队伍' });
+            const current = parties.get(playerParties.get(identityId));
+            if (current) return acknowledge({ ok: true, party: partyPayload(current) });
+            const code = randomCode(parties);
+            if (!code) return acknowledge({ ok: false, error: '无法生成队伍码，请重试' });
+            const party = { code, leaderId: identityId, state: 'lobby', roomCode: '', createdAt: Date.now(), members: new Map() };
+            const member = { id: identityId, name: socket.data.arenaIdentity.name, socketId: socket.id, status: 'lobby', offlineAt: 0 };
+            party.members.set(identityId, member);
+            parties.set(code, party);
+            playerParties.set(identityId, code);
+            attachPartySocket(party, member, socket);
+            broadcastParty(party);
+            acknowledge({ ok: true, party: partyPayload(party) });
+        });
+
+        socket.on('party_join', (data = {}, acknowledge = () => {}) => {
+            if (socket.data.arenaRoom) return acknowledge({ ok: false, error: '战斗中无法加入队伍' });
+            if (playerParties.has(identityId)) return acknowledge({ ok: false, error: '请先退出当前队伍' });
+            const code = cleanRoomCode(data.code);
+            const party = parties.get(code);
+            if (!party) return acknowledge({ ok: false, error: '队伍码不存在' });
+            if (party.state !== 'lobby') return acknowledge({ ok: false, error: '该队伍已经开始游戏' });
+            if (party.members.size >= PARTY_MAX_SIZE) return acknowledge({ ok: false, error: '队伍人数已满' });
+            const member = { id: identityId, name: socket.data.arenaIdentity.name, socketId: socket.id, status: 'lobby', offlineAt: 0 };
+            party.members.set(identityId, member);
+            playerParties.set(identityId, code);
+            attachPartySocket(party, member, socket);
+            broadcastParty(party);
+            acknowledge({ ok: true, party: partyPayload(party) });
+        });
+
+        socket.on('party_leave', (_data = {}, acknowledge = () => {}) => {
+            const party = parties.get(playerParties.get(identityId));
+            if (!party) return acknowledge({ ok: true });
+            if (party.state !== 'lobby') return acknowledge({ ok: false, error: '匹配或战斗中无法退出队伍' });
+            removePartyMember(party, identityId);
+            acknowledge({ ok: true });
+        });
+
+        socket.on('party_match', (_data = {}, acknowledge = () => {}) => {
+            const party = parties.get(playerParties.get(identityId));
+            if (!party) return acknowledge({ ok: false, error: '请先创建或加入队伍' });
+            if (party.leaderId !== identityId) return acknowledge({ ok: false, error: '只有队长可以开始游戏' });
+            if (party.state !== 'lobby') return acknowledge({ ok: false, error: '队伍正在匹配或战斗中' });
+            const members = Array.from(party.members.values());
+            const memberSockets = members.map(member => arena.sockets.get(member.socketId)).filter(Boolean);
+            if (memberSockets.length !== members.length) return acknowledge({ ok: false, error: '有队员已掉线，请等待其重连或退出队伍' });
+            if (getReservedPlayerCount() + members.length > MAX_TOTAL_PLAYERS) return acknowledge({ ok: false, error: '服务器已满，请稍后再试' });
+            const room = selectRoomForParty(members.length);
+            if (!room || maxPlayers - room.players.size < members.length) return acknowledge({ ok: false, error: '服务器已满，请稍后再试' });
+            party.state = 'matching';
+            party.roomCode = room.code;
+            for (const member of members) member.status = 'loading';
+            broadcastParty(party);
+            try {
+                for (let i = 0; i < members.length; i++) placeSocketInRoom(memberSockets[i], room, true);
+            } catch {
+                for (const memberSocket of memberSockets) if (memberSocket.data.arenaRoom === room.code) leaveCurrentRoom(memberSocket);
+                party.state = 'lobby'; party.roomCode = '';
+                for (const member of members) member.status = 'lobby';
+                broadcastParty(party);
+                return acknowledge({ ok: false, error: '匹配失败，请重试' });
+            }
+            party.state = 'in_game';
+            broadcastRoomState(room);
+            broadcastParty(party);
+            arena.to(partyRoomName(party.code)).emit('party_match_found', { roomCode: room.code, party: partyPayload(party) });
+            acknowledge({ ok: true, roomCode: room.code });
+        });
+
+        socket.on('party_return_lobby', (_data = {}, acknowledge = () => {}) => {
+            const party = parties.get(playerParties.get(identityId));
+            if (!party) return acknowledge({ ok: false, error: '队伍不存在' });
+            if (party.leaderId !== identityId) return acknowledge({ ok: false, error: '只有队长可以结束本局并返回大厅' });
+            const previousRoom = rooms.get(party.roomCode);
+            for (const member of party.members.values()) {
+                const memberSocket = member.socketId ? arena.sockets.get(member.socketId) : null;
+                if (memberSocket?.data.arenaRoom) leaveCurrentRoom(memberSocket);
+                else if (previousRoom?.players.has(member.id)) {
+                    releasePlayerIndex(previousRoom, member.id);
+                    previousRoom.players.delete(member.id);
+                }
+                member.status = memberSocket?.connected ? 'lobby' : 'offline';
+            }
+            party.state = 'lobby';
+            party.roomCode = '';
+            if (previousRoom) broadcastRoomState(previousRoom);
+            broadcastParty(party);
+            arena.to(partyRoomName(party.code)).emit('party_returned');
+            acknowledge({ ok: true, party: partyPayload(party) });
+        });
+
         socket.on('arena_join', (data = {}, acknowledge = () => {}) => {
+            const lobbyParty = parties.get(playerParties.get(identityId));
+            if (lobbyParty?.state === 'lobby') return acknowledge({ ok: false, error: '请由队长从组队大厅开始匹配' });
             leaveCurrentRoom(socket);
             for (const existingRoom of rooms.values()) {
                 const existingPlayer = existingRoom.players.get(socket.data.arenaIdentity.id);
@@ -793,6 +999,12 @@ function attachArrowArena({ app, io, authKey }) {
             if (sequence <= player.lastInputSeq || sequence > player.lastInputSeq + 10_000) return;
             player.lastInputSeq = sequence;
             player.lastInputAt = now;
+            if (player.loadingUntil) {
+                player.loadingUntil = 0;
+                const party = parties.get(playerParties.get(player.id));
+                const member = party?.members.get(player.id);
+                if (member && member.status !== 'playing') { member.status = 'playing'; broadcastParty(party); }
+            }
             const clientTime = finiteNumber(data.clientTime, now);
             const latencySample = clamp(now - clientTime, 0, 250);
             player.inputLatencyMs += (latencySample - player.inputLatencyMs) * (latencySample <= player.inputLatencyMs + 30 ? 0.22 : 0.06);
@@ -834,6 +1046,14 @@ function attachArrowArena({ app, io, authKey }) {
             markPlayerOffline(socket);
             const room = rooms.get(code);
             if (room) broadcastRoomState(room);
+            const party = parties.get(playerParties.get(identityId));
+            const member = party?.members.get(identityId);
+            if (member && member.socketId === socket.id) {
+                member.socketId = '';
+                member.status = 'offline';
+                member.offlineAt = Date.now();
+                broadcastParty(party);
+            }
             if (activeIdentities.get(identityId) === socket.id) activeIdentities.delete(identityId);
             if (activeBrowsers.get(browserKey) === socket.id) {
                 activeBrowsers.delete(browserKey);
@@ -919,6 +1139,12 @@ function attachArrowArena({ app, io, authKey }) {
         // Incremental TTL cleanup keeps these internet-facing maps bounded without
         // periodically dropping all active rate-limit/identity state at once.
         if (roomCleanupTick++ % 900 === 0) {
+            for (const party of parties.values()) {
+                if (party.state !== 'lobby') continue;
+                for (const member of Array.from(party.members.values())) {
+                    if (member.offlineAt && now - member.offlineAt >= PARTY_LOBBY_OFFLINE_MS) removePartyMember(party, member.id);
+                }
+            }
             for (const [key, rate] of sessionRates) if (now - rate.at > 2 * 60_000) sessionRates.delete(key);
             for (const [key, identity] of browserIdentities) {
                 if (now - identity.lastSeen > 24 * 60 * 60_000) browserIdentities.delete(key);

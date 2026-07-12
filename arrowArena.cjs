@@ -18,6 +18,10 @@ const PLAYER_HIT_RADIUS = 20;
 const PARTY_MAX_SIZE = 4;
 const MATCH_LOADING_MS = 12_000;
 const PARTY_LOBBY_OFFLINE_MS = 30_000;
+const PARTY_CREATE_COOLDOWN_MS = 3 * 60_000;
+const PARTY_CREATE_WINDOW_MS = 60 * 60_000;
+const PARTY_CREATE_LIMIT = 6;
+const MAX_PARTIES = 512;
 
 const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
@@ -560,6 +564,7 @@ function attachArrowArena({ app, io, authKey }) {
     const browserIdentities = new Map();
     const parties = new Map();
     const playerParties = new Map();
+    const partyCreateRates = new Map();
     const arena = io.of('/arrow-arena');
 
     function getOnlinePlayerCount(room) {
@@ -581,6 +586,21 @@ function attachArrowArena({ app, io, authKey }) {
     }
 
     function partyRoomName(code) { return `party:${code}`; }
+
+    function consumePartyCreate(identityId, now) {
+        let rate = partyCreateRates.get(identityId);
+        if (!rate || now - rate.windowAt >= PARTY_CREATE_WINDOW_MS) rate = { windowAt: now, lastAt: 0, count: 0 };
+        const cooldownLeft = PARTY_CREATE_COOLDOWN_MS - (now - rate.lastAt);
+        if (cooldownLeft > 0) return { ok: false, error: `创建过于频繁，请 ${Math.ceil(cooldownLeft / 60_000)} 分钟后再试` };
+        if (rate.count >= PARTY_CREATE_LIMIT) {
+            const resetLeft = PARTY_CREATE_WINDOW_MS - (now - rate.windowAt);
+            return { ok: false, error: `每小时最多创建 ${PARTY_CREATE_LIMIT} 支队伍，请 ${Math.ceil(resetLeft / 60_000)} 分钟后再试` };
+        }
+        rate.lastAt = now;
+        rate.count++;
+        partyCreateRates.set(identityId, rate);
+        return { ok: true };
+    }
 
     function partyPayload(party) {
         return {
@@ -820,6 +840,9 @@ function attachArrowArena({ app, io, authKey }) {
             if (socket.data.arenaRoom) return acknowledge({ ok: false, error: '战斗中无法创建队伍' });
             const current = parties.get(playerParties.get(identityId));
             if (current) return acknowledge({ ok: true, party: partyPayload(current) });
+            if (parties.size >= MAX_PARTIES) return acknowledge({ ok: false, error: '组队大厅繁忙，请稍后再试' });
+            const createRate = consumePartyCreate(identityId, Date.now());
+            if (!createRate.ok) return acknowledge(createRate);
             const code = randomCode(parties);
             if (!code) return acknowledge({ ok: false, error: '无法生成队伍码，请重试' });
             const party = { code, leaderId: identityId, state: 'lobby', roomCode: '', createdAt: Date.now(), members: new Map() };
@@ -1145,6 +1168,7 @@ function attachArrowArena({ app, io, authKey }) {
                     if (member.offlineAt && now - member.offlineAt >= PARTY_LOBBY_OFFLINE_MS) removePartyMember(party, member.id);
                 }
             }
+            for (const [playerId, rate] of partyCreateRates) if (now - rate.windowAt >= PARTY_CREATE_WINDOW_MS * 2) partyCreateRates.delete(playerId);
             for (const [key, rate] of sessionRates) if (now - rate.at > 2 * 60_000) sessionRates.delete(key);
             for (const [key, identity] of browserIdentities) {
                 if (now - identity.lastSeen > 24 * 60 * 60_000) browserIdentities.delete(key);

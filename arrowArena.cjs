@@ -13,6 +13,8 @@ const DASH_COOLDOWN_MS = 1800;
 const DASH_ENERGY = 20;
 const ENERGY_REGEN_PER_SECOND = 5;
 const HIT_PROTECTION_MS = 110;
+const INPUT_STALE_MS = 250;
+const PLAYER_HIT_RADIUS = 24;
 
 const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
@@ -299,7 +301,7 @@ function createPlayer(identity, socket, room) {
         lastInputSeq: 0, lastShot: 0, lastDash: 0,
         dashUntil: 0, invulnerableUntil: Date.now() + 1000, respawnAt: 0,
         offlineAt: 0,
-        inputWindowAt: Date.now(), inputCount: 0, strikes: 0,
+        inputWindowAt: Date.now(), inputCount: 0, strikes: 0, lastInputAt: Date.now(),
         input: { moveX: 0, moveY: 0, aimX: 1, aimY: 0, shooting: false, dash: false },
         _delta: new Map()
     };
@@ -376,7 +378,7 @@ function useWeapon(room, player, now) {
             const dx = target.x - player.x;
             const dy = target.y - player.y;
             const distanceSq = dx * dx + dy * dy;
-            if (distanceSq > 1 && distanceSq <= rangeSq && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
+            if (distanceSq > 1 && distanceSq <= (swordRange + PLAYER_HIT_RADIUS) ** 2 && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
                 damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now, player.weapon);
             }
         }
@@ -428,6 +430,12 @@ function simulateRoom(room, now, dt) {
         }
 
         const input = player.input;
+        // UDP-like volatile inputs may stop when a tab is suspended or a connection
+        // degrades. Never keep applying an old movement/fire command indefinitely.
+        if (now - player.lastInputAt > INPUT_STALE_MS) {
+            input.moveX = input.moveY = 0;
+            input.shooting = input.dash = false;
+        }
         if (input.dash) {
             input.dash = false;
             if (now - player.lastDash >= player.dashCooldown && player.energy >= DASH_ENERGY) {
@@ -467,7 +475,8 @@ function simulateRoom(room, now, dt) {
         const owner = room.players.get(projectile.ownerId);
         for (const target of room.players.values()) {
             if (!target.alive || target.offlineAt || target.id === projectile.ownerId || projectile.hitIds.has(target.id)) continue;
-            if (pointSegmentDistanceSq(target.x, target.y, previousX, previousY, projectile.x, projectile.y) > projectile.hitRadius * projectile.hitRadius) continue;
+            const hitRadius = projectile.hitRadius + PLAYER_HIT_RADIUS;
+            if (pointSegmentDistanceSq(target.x, target.y, previousX, previousY, projectile.x, projectile.y) > hitRadius * hitRadius) continue;
             projectile.hitIds.add(target.id);
             damagePlayer(room, target, owner, projectile.damage, now, projectile.weapon);
             if (projectile.pierce-- <= 0) { deactivateProjectile(projectile); break; }
@@ -657,6 +666,7 @@ function attachArrowArena({ app, io, authKey }) {
                 existingPlayer.inputWindowAt = Date.now();
                 existingPlayer.inputCount = 0;
                 existingPlayer.strikes = 0;
+                existingPlayer.lastInputAt = Date.now();
                 existingPlayer._delta.clear();
                 existingRoom.emptyAt = 0;
                 socket.data.arenaRoom = existingRoom.code;
@@ -727,6 +737,7 @@ function attachArrowArena({ app, io, authKey }) {
             const sequence = Math.trunc(finiteNumber(data.sequence, -1));
             if (sequence <= player.lastInputSeq || sequence > player.lastInputSeq + 10_000) return;
             player.lastInputSeq = sequence;
+            player.lastInputAt = now;
             let moveX = clamp(finiteNumber(data.moveX), -1, 1);
             let moveY = clamp(finiteNumber(data.moveY), -1, 1);
             const moveLength = Math.hypot(moveX, moveY);
@@ -777,6 +788,7 @@ function attachArrowArena({ app, io, authKey }) {
     });
 
     let previous = Date.now();
+    let roomCleanupTick = 0;
     const timer = setInterval(() => {
         const now = Date.now();
         const dt = Math.min(0.1, (now - previous) / 1000);
@@ -846,10 +858,19 @@ function attachArrowArena({ app, io, authKey }) {
                 }
             }
         }
-        if (sessionRates.size > 2048) sessionRates.clear();
-        if (browserIdentities.size > 4096) {
-            for (const [key, identity] of browserIdentities) if (now - identity.lastSeen > 24 * 60 * 60_000) browserIdentities.delete(key);
-            if (browserIdentities.size > 4096) browserIdentities.clear();
+        // Incremental TTL cleanup keeps these internet-facing maps bounded without
+        // periodically dropping all active rate-limit/identity state at once.
+        if (roomCleanupTick++ % 900 === 0) {
+            for (const [key, rate] of sessionRates) if (now - rate.at > 2 * 60_000) sessionRates.delete(key);
+            for (const [key, identity] of browserIdentities) {
+                if (now - identity.lastSeen > 24 * 60 * 60_000) browserIdentities.delete(key);
+            }
+        }
+        if (sessionRates.size > 4096) {
+            for (const key of sessionRates.keys()) { sessionRates.delete(key); if (sessionRates.size <= 2048) break; }
+        }
+        if (browserIdentities.size > 8192) {
+            for (const key of browserIdentities.keys()) { browserIdentities.delete(key); if (browserIdentities.size <= 4096) break; }
         }
     }, TICK_MS);
     timer.unref?.();

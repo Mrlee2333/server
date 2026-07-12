@@ -12,7 +12,6 @@ const EMPTY_ROOM_TTL_MS = 10_000;
 const DASH_COOLDOWN_MS = 1800;
 const DASH_ENERGY = 20;
 const ENERGY_REGEN_PER_SECOND = 5;
-const HIT_PROTECTION_MS = 110;
 const INPUT_STALE_MS = 250;
 const PLAYER_HIT_RADIUS = 20;
 const PARTY_MAX_SIZE = 4;
@@ -27,7 +26,7 @@ const WEAPONS = Object.freeze({
     sword: { damage: 50, cooldown: 430, range: 142, speed: 0, life: 0, pierce: 0 },
     bow: { damage: 31, cooldown: 560, range: 820, speed: 760, life: 1100, pierce: 0, hitRadius: 14 },
     pistol: { damage: 13, cooldown: 190, range: 900, speed: 1150, life: 800, pierce: 0, hitRadius: 10 },
-    pulse: { damage: 30, cooldown: 450, range: 800, speed: 760, life: 1080, pierce: 1, energy: 9, hitRadius: 18 }
+    pulse: { damage: 38, cooldown: 410, range: 840, speed: 820, life: 1080, pierce: 1, energy: 7, hitRadius: 18 }
 });
 const UPGRADE_IDS = Object.freeze(['damage', 'speed', 'health', 'rapid', 'multishot', 'pierce', 'lifesteal', 'dash']);
 
@@ -159,7 +158,7 @@ function applyUpgrade(player, id) {
     else if (id === 'speed') player.speed = Math.min(340, player.speed * 1.1);
     else if (id === 'health') { player.maxHp = Math.min(350, player.maxHp + 30); player.hp = Math.min(player.maxHp, player.hp + 40); }
     else if (id === 'rapid') player.cooldownScale = Math.max(0.52, player.cooldownScale * 0.86);
-    else if (id === 'multishot') player.multishot = Math.min(4, player.multishot + 1);
+    else if (id === 'multishot') player.multishot = Math.min(5, player.multishot + 1);
     else if (id === 'pierce') player.pierceBonus = Math.min(4, player.pierceBonus + 1);
     else if (id === 'lifesteal') player.lifesteal = Math.min(0.25, player.lifesteal + 0.05);
     else if (id === 'dash') player.dashCooldown = Math.max(850, player.dashCooldown * 0.82);
@@ -344,7 +343,6 @@ function damagePlayer(room, target, owner, damage, now, weapon, impactX = target
     const appliedDamage = previousHp - target.hp;
     if (appliedDamage <= 0) return false;
     if (owner && owner !== target && owner.lifesteal > 0) owner.hp = Math.min(owner.maxHp, owner.hp + appliedDamage * owner.lifesteal);
-    target.invulnerableUntil = now + HIT_PROTECTION_MS;
     const killed = target.hp <= 0;
     room.arena?.to(room.code).emit('arena_hit', {
         id: room.nextCombatEventId++,
@@ -405,7 +403,9 @@ function useWeapon(room, player, now) {
             vx: Math.round(player.vx), vy: Math.round(player.vy),
             aimX: player.aimX, aimY: player.aimY, time: attackTime, projectiles: []
         });
-        const swordRange = weapon.range * (1 + (player.multishot - 1) * 0.08);
+        const multishotRangeBonus = Math.min(0.24, (player.multishot - 1) * 0.06);
+        const pierceRangeBonus = Math.min(0.4, player.pierceBonus * 0.1);
+        const swordRange = weapon.range * (1 + multishotRangeBonus + pierceRangeBonus);
         const rangeSq = swordRange * swordRange;
         for (const target of room.players.values()) {
             if (target === player || !target.alive || target.offlineAt) continue;
@@ -414,17 +414,17 @@ function useWeapon(room, player, now) {
             const dy = combatTarget.y - player.y;
             const distanceSq = dx * dx + dy * dy;
             if (distanceSq > 1 && distanceSq <= (swordRange + PLAYER_HIT_RADIUS) ** 2 && (dx * player.aimX + dy * player.aimY) / Math.sqrt(distanceSq) > 0.15) {
-                damagePlayer(room, target, player, weapon.damage * player.damageScale * (1 + player.pierceBonus * 0.08), now, player.weapon, combatTarget.x, combatTarget.y);
+                damagePlayer(room, target, player, weapon.damage * player.damageScale, now, player.weapon, combatTarget.x, combatTarget.y);
             }
         }
         return;
     }
 
-    const count = player.weapon === 'pulse' ? 1 : player.multishot;
+    const count = player.weapon === 'bow' ? player.multishot : player.weapon === 'pistol' ? Math.min(2, player.multishot) : 1;
     for (let i = 0; i < count; i++) {
         const projectile = getProjectile(room);
         if (!projectile) break;
-        const spread = count === 1 ? 0 : (i - (count - 1) / 2) * (player.weapon === 'pistol' ? 0.075 : 0.11);
+        const spread = count === 1 ? 0 : (i - (count - 1) / 2) * (player.weapon === 'pistol' ? 0.085 : 0.13);
         const baseAngle = Math.atan2(player.aimY, player.aimX) + spread;
         const dx = Math.cos(baseAngle), dy = Math.sin(baseAngle);
         projectile.active = true;
@@ -508,6 +508,7 @@ function simulateRoom(room, now, dt) {
             if (now - player.lastDash >= player.dashCooldown && player.energy >= DASH_ENERGY) {
                 player.lastDash = now;
                 player.dashUntil = now + 190;
+                player.invulnerableUntil = Math.max(player.invulnerableUntil, player.dashUntil);
                 player.energy -= DASH_ENERGY;
                 const hasMove = Math.abs(input.moveX) + Math.abs(input.moveY) > 0.05;
                 player.dashX = hasMove ? input.moveX : player.aimX;
@@ -929,6 +930,27 @@ function attachArrowArena({ app, io, authKey }) {
             if (previousRoom) broadcastRoomState(previousRoom);
             broadcastParty(party);
             arena.to(partyRoomName(party.code)).emit('party_returned');
+            acknowledge({ ok: true, party: partyPayload(party) });
+        });
+
+        socket.on('party_leave_match', (_data = {}, acknowledge = () => {}) => {
+            const party = parties.get(playerParties.get(identityId));
+            if (!party) return acknowledge({ ok: false, error: '队伍不存在' });
+            if (party.state !== 'in_game') return acknowledge({ ok: false, error: '当前不在战斗中' });
+            const room = rooms.get(party.roomCode);
+            const member = party.members.get(identityId);
+            if (!member) return acknowledge({ ok: false, error: '你不在该队伍中' });
+            if (socket.data.arenaRoom) leaveCurrentRoom(socket);
+            else if (room?.players.has(identityId)) {
+                releasePlayerIndex(room, identityId);
+                room.players.delete(identityId);
+            }
+            member.status = 'lobby';
+            const stillPlaying = Array.from(party.members.values()).some(item => item.status === 'playing' || item.status === 'loading');
+            if (!stillPlaying) { party.state = 'lobby'; party.roomCode = ''; }
+            if (room) broadcastRoomState(room);
+            broadcastParty(party);
+            arena.to(socket.id).emit('party_member_returned');
             acknowledge({ ok: true, party: partyPayload(party) });
         });
 

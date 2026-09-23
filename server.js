@@ -133,10 +133,8 @@ const app = express();
 app.set('trust proxy', true);
 
 const defaultAllowedOrigins = [
-    "https://player.arksec.net",
-    "https://game.arksec.net",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173"
+    "https://ok.arksec.net",
+    "http://chat.arksec.net"
 ];
 
 const allowedOrigins = (process.env.CORS_ORIGINS || defaultAllowedOrigins.join(','))
